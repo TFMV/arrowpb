@@ -26,15 +26,15 @@ var TypeMappings = map[arrow.DataType]descriptorpb.FieldDescriptorProto_Type{
 	arrow.FixedWidthTypes.Timestamp_s: descriptorpb.FieldDescriptorProto_TYPE_STRING,
 }
 
-// generateUniqueName creates a unique name for the ProtoBuf message.
-func generateUniqueName(prefix string) string {
+// GenerateUniqueName creates a unique name for the ProtoBuf message.
+func GenerateUniqueName(prefix string) string {
 	timestamp := time.Now().Unix()
 	randomSuffix := rand.Intn(9999)
 	return fmt.Sprintf("%s_%d_%04d", prefix, timestamp, randomSuffix)
 }
 
-// createNestedMessage constructs a nested ProtoBuf message descriptor.
-func createNestedMessage(fieldType *arrow.StructType, messageName string) *descriptorpb.DescriptorProto {
+// CreateNestedMessage constructs a nested ProtoBuf message descriptor.
+func CreateNestedMessage(fieldType *arrow.StructType, messageName string) *descriptorpb.DescriptorProto {
 	nestedDescriptor := &descriptorpb.DescriptorProto{Name: &messageName}
 
 	for i, field := range fieldType.Fields() {
@@ -54,9 +54,9 @@ func createNestedMessage(fieldType *arrow.StructType, messageName string) *descr
 	return nestedDescriptor
 }
 
-// arrowSchemaToProto converts an Arrow schema into a Protocol Buffers descriptor.
-func arrowSchemaToProto(schema *arrow.Schema) *descriptorpb.DescriptorProto {
-	messageName := generateUniqueName("ArrowMessage")
+// ArrowSchemaToProto converts an Arrow schema into a Protocol Buffers descriptor.
+func ArrowSchemaToProto(schema *arrow.Schema) *descriptorpb.DescriptorProto {
+	messageName := GenerateUniqueName("ArrowMessage")
 
 	descriptorProto := &descriptorpb.DescriptorProto{Name: &messageName}
 
@@ -65,7 +65,7 @@ func arrowSchemaToProto(schema *arrow.Schema) *descriptorpb.DescriptorProto {
 	for _, field := range schema.Fields() {
 		if structType, ok := field.Type.(*arrow.StructType); ok {
 			nestedName := field.Name + "Type"
-			nestedMessage := createNestedMessage(structType, nestedName)
+			nestedMessage := CreateNestedMessage(structType, nestedName)
 			nestedTypes[field.Name] = nestedMessage
 			descriptorProto.NestedType = append(descriptorProto.NestedType, nestedMessage)
 		}
@@ -94,8 +94,8 @@ func arrowSchemaToProto(schema *arrow.Schema) *descriptorpb.DescriptorProto {
 	return descriptorProto
 }
 
-// arrowRecordToProto converts an Arrow RecordBatch into serialized ProtoBuf messages.
-func arrowRecordToProto(record arrow.Record, descriptorProto *descriptorpb.DescriptorProto) ([]byte, error) {
+// ArrowRecordToProto converts an Arrow RecordBatch into serialized ProtoBuf messages.
+func ArrowRecordToProto(record arrow.Record, descriptorProto *descriptorpb.DescriptorProto) ([]byte, error) {
 	// Initialize Protobuf message map
 	protoMessage := make(map[string]interface{})
 
@@ -105,7 +105,7 @@ func arrowRecordToProto(record arrow.Record, descriptorProto *descriptorpb.Descr
 		fieldName := field.Name
 
 		// Extract value based on type
-		value := extractValue(column, 0) // Assuming single-row records
+		value := ExtractValue(column, 0) // Assuming single-row records
 
 		// Assign to the Protobuf message map
 		if value != nil {
@@ -120,8 +120,8 @@ func arrowRecordToProto(record arrow.Record, descriptorProto *descriptorpb.Descr
 	})
 }
 
-// extractValue retrieves a value from an Arrow column at a specific row index.
-func extractValue(col arrow.Array, rowIndex int) any {
+// ExtractValue retrieves a value from an Arrow column at a specific row index.
+func ExtractValue(col arrow.Array, rowIndex int) any {
 	switch col := col.(type) {
 	case *array.Int64:
 		return col.Value(rowIndex)
@@ -136,7 +136,8 @@ func extractValue(col arrow.Array, rowIndex int) any {
 	}
 }
 
-func arrowRowToProto(record arrow.Record, descriptorProto *descriptorpb.DescriptorProto, rowIndex int) ([]byte, error) {
+// ArrowRowToProto converts a single row in an Arrow RecordBatch to a Protobuf message.
+func ArrowRowToProto(record arrow.Record, descriptorProto *descriptorpb.DescriptorProto, rowIndex int) ([]byte, error) {
 	protoMessage := make(map[string]interface{})
 
 	for colIdx, field := range record.Schema().Fields() {
@@ -144,7 +145,7 @@ func arrowRowToProto(record arrow.Record, descriptorProto *descriptorpb.Descript
 		fieldName := field.Name
 
 		// Extract value for the specific row
-		value := extractValue(column, rowIndex)
+		value := ExtractValue(column, rowIndex)
 
 		if value != nil {
 			protoMessage[fieldName] = value
@@ -157,14 +158,15 @@ func arrowRowToProto(record arrow.Record, descriptorProto *descriptorpb.Descript
 	})
 }
 
-func arrowBatchToProto(reader array.RecordReader, protoDescriptor *descriptorpb.DescriptorProto) [][]byte {
+// ArrowBatchToProto converts an Arrow RecordReader into serialized ProtoBuf messages.
+func ArrowBatchToProto(reader array.RecordReader, protoDescriptor *descriptorpb.DescriptorProto) [][]byte {
 	var protoMessages [][]byte
 
 	for reader.Next() {
 		record := reader.Record()
 
 		for row := 0; row < int(record.NumRows()); row++ {
-			message, err := arrowRowToProto(record, protoDescriptor, row)
+			message, err := ArrowRowToProto(record, protoDescriptor, row)
 			if err != nil {
 				log.Printf("Failed to convert row %d to Protobuf: %v", row, err)
 				continue
@@ -180,8 +182,8 @@ func arrowBatchToProto(reader array.RecordReader, protoDescriptor *descriptorpb.
 	return protoMessages
 }
 
-// createArrowRecord creates a sample Arrow RecordBatch for testing.
-func createArrowRecord() (array.RecordReader, error) {
+// CreateArrowRecord creates a sample Arrow RecordBatch for testing.
+func CreateArrowRecord() (array.RecordReader, error) {
 	mem := memory.NewGoAllocator()
 
 	schema := arrow.NewSchema([]arrow.Field{
@@ -202,6 +204,7 @@ func createArrowRecord() (array.RecordReader, error) {
 	return array.NewRecordReader(schema, []arrow.Record{record})
 }
 
+// FormatArrowJSON formats Arrow records as pretty-printed JSON.
 func FormatArrowJSON(reader array.RecordReader, output io.Writer) error {
 	defer reader.Release()
 
@@ -215,7 +218,7 @@ func FormatArrowJSON(reader array.RecordReader, output io.Writer) error {
 
 			for colIdx, field := range record.Schema().Fields() {
 				col := record.Column(colIdx)
-				rowData[field.Name] = extractValue(col, row)
+				rowData[field.Name] = ExtractValue(col, row)
 			}
 
 			records = append(records, rowData)
