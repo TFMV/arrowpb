@@ -2,6 +2,8 @@
 
 Convert Apache Arrow records to Protocol Buffers
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/TFMV/arrowpb)](https://goreportcard.com/report/github.com/TFMV/arrowpb)
+
 ## Introduction
 
 `arrowpb` is a library designed to facilitate the conversion of Apache Arrow records into Protocol Buffers format. This allows for efficient serialization and deserialization of data structures, making it easier to work with data across different systems.
