@@ -1,4 +1,4 @@
-package main
+package arrowpb
 
 import (
 	"encoding/json"
