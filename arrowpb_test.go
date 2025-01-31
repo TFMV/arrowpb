@@ -63,7 +63,7 @@ func TestArrowSchemaToProto(t *testing.T) {
 		{Name: "active", Type: arrow.FixedWidthTypes.Boolean},
 	}, nil)
 
-	descriptor := arrowSchemaToProto(schema)
+	descriptor := ArrowSchemaToProto(schema)
 
 	// Verify descriptor fields
 	assert.True(t, strings.HasPrefix(*descriptor.Name, "ArrowMessage_"))
@@ -82,7 +82,7 @@ func TestArrowSchemaToProto(t *testing.T) {
 
 func TestCreateArrowRecord(t *testing.T) {
 	t.Parallel()
-	reader, err := createArrowRecord()
+	reader, err := CreateArrowRecord()
 	require.NoError(t, err)
 	defer reader.Release()
 
@@ -132,8 +132,8 @@ func TestArrowBatchToProto(t *testing.T) {
 	defer reader.Release()
 
 	// Convert Arrow batch to Protobuf messages
-	protoDescriptor := arrowSchemaToProto(schema)
-	protoMessages := arrowBatchToProto(reader, protoDescriptor)
+	protoDescriptor := ArrowSchemaToProto(schema)
+	protoMessages := ArrowBatchToProto(reader, protoDescriptor)
 
 	// Verify number of messages
 	assert.Equal(t, 2, len(protoMessages))
