@@ -1,3 +1,36 @@
+// --------------------------------------------------------------------------------
+// Author: Thomas F McGeehan V
+//
+// This file is part of a software project developed by Thomas F McGeehan V.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// For more information about the MIT License, please visit:
+// https://opensource.org/licenses/MIT
+//
+// Acknowledgment appreciated but not required.
+// --------------------------------------------------------------------------------
+
+// Package arrowpb provides utilities for converting Arrow data to Protocol Buffers.
+// It includes functions for generating FileDescriptorProtos, compiling them, and
+// converting Arrow records to Protocol Buffer messages.
+
 package arrowpb
 
 import (
@@ -18,14 +51,20 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"go.uber.org/zap"
+
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-// Add a package-level logger
+// ----------------------------------------------------------------------------
+// 1) Package-Level Logger
+// ----------------------------------------------------------------------------
+
 var logger *zap.Logger
 
 func init() {
@@ -36,24 +75,43 @@ func init() {
 	}
 }
 
-// TypeMappings maps primitive Arrow types to their corresponding
-// Protocol Buffers FieldDescriptorProto_Type. Extend for more coverage!
-var TypeMappings = map[arrow.Type]descriptorpb.FieldDescriptorProto_Type{
-	arrow.BOOL:    descriptorpb.FieldDescriptorProto_TYPE_BOOL,
-	arrow.INT64:   descriptorpb.FieldDescriptorProto_TYPE_INT64,
-	arrow.FLOAT64: descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
-	arrow.STRING:  descriptorpb.FieldDescriptorProto_TYPE_STRING,
-	arrow.BINARY:  descriptorpb.FieldDescriptorProto_TYPE_BYTES,
+// ----------------------------------------------------------------------------
+// 2) ConvertConfig with Enhanced Options
+// ----------------------------------------------------------------------------
 
-	// Many Arrow date/time/timestamp types can be mapped to strings or
-	// google.protobuf.Timestamp. For simplicity, we'll map them to strings:
-	arrow.DATE32:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
-	arrow.DATE64:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
-	arrow.TIMESTAMP: descriptorpb.FieldDescriptorProto_TYPE_STRING,
+// ConvertConfig allows fine-grained control over Arrow => Protobuf schema generation.
+type ConvertConfig struct {
+	UseWellKnownTimestamps bool // arrow.TIMESTAMP => google.protobuf.Timestamp
+	UseProto2Syntax        bool // changes FileDescriptorProto syntax to "proto2"
+	UseWrapperTypes        bool // arrow scalars => google.protobuf.*Value
+	MapDictionariesToEnums bool // dictionary => enum
+
+	// DescriptorCache can store repeated schemas => reuse of the same descriptor
+	DescriptorCache sync.Map
 }
 
-// GenerateUniqueMessageName provides a unique name for the top-level message.
-// In production, you might prefer a deterministic name or a different scheme.
+// defaultTypeMappings returns base arrow->proto mapping, factoring in well-known timestamps.
+func defaultTypeMappings(cfg *ConvertConfig) map[arrow.Type]descriptorpb.FieldDescriptorProto_Type {
+	out := map[arrow.Type]descriptorpb.FieldDescriptorProto_Type{
+		arrow.BOOL:      descriptorpb.FieldDescriptorProto_TYPE_BOOL,
+		arrow.INT64:     descriptorpb.FieldDescriptorProto_TYPE_INT64,
+		arrow.FLOAT64:   descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
+		arrow.STRING:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.BINARY:    descriptorpb.FieldDescriptorProto_TYPE_BYTES,
+		arrow.DATE32:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.DATE64:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.TIMESTAMP: descriptorpb.FieldDescriptorProto_TYPE_STRING, // override below if UseWellKnownTimestamps
+	}
+	if cfg.UseWellKnownTimestamps {
+		out[arrow.TIMESTAMP] = descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
+	}
+	return out
+}
+
+// ----------------------------------------------------------------------------
+// 3) Descriptor Generation (Lists, Structs, Dictionary => Enum, Wrappers, etc.)
+// ----------------------------------------------------------------------------
+
 func GenerateUniqueMessageName(prefix string) string {
 	var builder strings.Builder
 	builder.WriteString(prefix)
@@ -64,127 +122,258 @@ func GenerateUniqueMessageName(prefix string) string {
 	return builder.String()
 }
 
-// buildFieldDescriptor builds a FieldDescriptorProto for a single Arrow field.
-func buildFieldDescriptor(field arrow.Field, index int32) (*descriptorpb.FieldDescriptorProto, []*descriptorpb.DescriptorProto, error) {
-	fd := &descriptorpb.FieldDescriptorProto{
-		Name:   proto.String(field.Name),
-		Number: proto.Int32(index),
+func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, messagePrefix string, cfg *ConvertConfig) (*descriptorpb.FileDescriptorProto, error) {
+	if cfg == nil {
+		cfg = &ConvertConfig{}
 	}
 
-	nestedMessages := []*descriptorpb.DescriptorProto{}
-
-	// Handle nested StructTypes
-	if st, ok := field.Type.(*arrow.StructType); ok {
-		// Build a nested descriptor
-		nestedName := fmt.Sprintf("%s_struct_%d", field.Name, index)
-		nestedDesc, err := arrowStructToDescriptor(st, nestedName)
-		if err != nil {
-			return nil, nil, err
+	// 1) If cached
+	if val, ok := cfg.DescriptorCache.Load(schema); ok {
+		if fdp, ok2 := val.(*descriptorpb.FileDescriptorProto); ok2 {
+			logger.Info("Using cached descriptor for schema.")
+			return fdp, nil
 		}
-
-		// The field will be a TYPE_MESSAGE referencing the nested descriptor
-		fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-		fd.TypeName = proto.String(nestedName)
-		nestedMessages = append(nestedMessages, nestedDesc)
-		return fd, nestedMessages, nil
 	}
 
-	// Handle list (repeated) types, e.g. arrow.ListType or arrow.FixedSizeListType
-	if lt, ok := field.Type.(*arrow.ListType); ok {
-		// We only handle one-dimensional list -> repeated of the element type
-		elemField := arrow.Field{
-			Name: field.Name + "_elem",
-			Type: lt.Elem(),
-		}
-		// We'll build a descriptor for the "inner" part
-		// but effectively we'll mark the outer field as repeated
-		innerFD, nested, err := buildFieldDescriptor(elemField, index)
-		if err != nil {
-			return nil, nil, err
-		}
-		// Force repeated
-		fd.Label = descriptorpb.FieldDescriptorProto_Label(descriptorpb.FieldDescriptorProto_LABEL_REPEATED).Enum()
-
-		// If it's a primitive element, just copy its type
-		fd.Type = innerFD.Type
-		fd.TypeName = proto.String(innerFD.GetTypeName())
-		nestedMessages = append(nestedMessages, nested...)
-		return fd, nestedMessages, nil
-	}
-
-	// If it's a known primitive (or string, bytes, etc.)
-	t, ok := TypeMappings[field.Type.ID()]
-	if !ok {
-		return nil, nil, fmt.Errorf("unsupported Arrow type: %v", field.Type)
-	}
-	fd.Type = t.Enum()
-	return fd, nil, nil
-}
-
-// arrowStructToDescriptor recursively builds a DescriptorProto from an Arrow StructType.
-func arrowStructToDescriptor(st *arrow.StructType, messageName string) (*descriptorpb.DescriptorProto, error) {
-	desc := &descriptorpb.DescriptorProto{
-		Name: proto.String(messageName),
-	}
-
-	var nestedTypes []*descriptorpb.DescriptorProto
-	for i, f := range st.Fields() {
-		fd, moreNested, err := buildFieldDescriptor(f, int32(i+1))
-		if err != nil {
-			return nil, err
-		}
-		desc.Field = append(desc.Field, fd)
-		nestedTypes = append(nestedTypes, moreNested...)
-	}
-
-	// Add any nested descriptors to NestedType
-	desc.NestedType = append(desc.NestedType, nestedTypes...)
-	return desc, nil
-}
-
-// ArrowSchemaToFileDescriptorProto converts an Arrow schema into a FileDescriptorProto.
-// This yields a top-level message plus any nested messages.
-func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, messagePrefix string) (*descriptorpb.FileDescriptorProto, error) {
-	// Build descriptor for top-level
+	// 2) Build top-level message
 	topMsgName := GenerateUniqueMessageName(messagePrefix)
-	topDesc := &descriptorpb.DescriptorProto{
-		Name: proto.String(topMsgName),
-	}
+	topDesc := &descriptorpb.DescriptorProto{Name: proto.String(topMsgName)}
 
-	var nestedTypes []*descriptorpb.DescriptorProto
+	var nestedEnums []*descriptorpb.EnumDescriptorProto
 
-	// Build each field in the schema
-	for i, field := range schema.Fields() {
-		fd, moreNested, err := buildFieldDescriptor(field, int32(i+1))
+	// 3) Build fields
+	for i, f := range schema.Fields() {
+		fd, moNested, moEnum, err := buildFieldDescriptor(topDesc, f, int32(i+1), cfg)
 		if err != nil {
 			return nil, err
 		}
 		topDesc.Field = append(topDesc.Field, fd)
-		nestedTypes = append(nestedTypes, moreNested...)
+		// moNested => nested messages
+		topDesc.NestedType = append(topDesc.NestedType, moNested...)
+		// moEnum => any new enums from dictionary
+		nestedEnums = append(nestedEnums, moEnum...)
 	}
 
-	// Attach nested descriptors
-	topDesc.NestedType = append(topDesc.NestedType, nestedTypes...)
+	// Attach any newly built enums (e.g. from dictionary) to topDesc
+	if len(nestedEnums) > 0 {
+		topDesc.EnumType = append(topDesc.EnumType, nestedEnums...)
+	}
 
-	// Build a FileDescriptorProto
+	// 4) Build FileDescriptorProto
+	syntax := "proto3"
+	if cfg.UseProto2Syntax {
+		syntax = "proto2"
+	}
 	fdp := &descriptorpb.FileDescriptorProto{
 		Name:    proto.String(topMsgName + ".proto"),
 		Package: proto.String(packageName),
 		MessageType: []*descriptorpb.DescriptorProto{
 			topDesc,
 		},
-		Syntax: proto.String("proto3"),
+		Syntax: proto.String(syntax),
 	}
+
+	// 5) If we reference WKT => add dependency
+	//    This helps the compiler see "google/protobuf/timestamp.proto" or "wrappers.proto"
+	if cfg.UseWellKnownTimestamps {
+		fdp.Dependency = append(fdp.Dependency, "google/protobuf/timestamp.proto")
+	}
+	if cfg.UseWrapperTypes {
+		fdp.Dependency = append(fdp.Dependency, "google/protobuf/wrappers.proto")
+	}
+
+	// 6) Store in cache
+	cfg.DescriptorCache.Store(schema, fdp)
 	return fdp, nil
 }
 
-// CompileFileDescriptorProto compiles a FileDescriptorProto into a protoreflect.FileDescriptor,
-// which we can then use to obtain the top-level message descriptor for dynamic creation.
-func CompileFileDescriptorProto(fdp *descriptorpb.FileDescriptorProto) (protoreflect.FileDescriptor, error) {
-	fdset := &descriptorpb.FileDescriptorSet{
-		File: []*descriptorpb.FileDescriptorProto{fdp},
+// buildFieldDescriptor constructs a single field, returning:
+// - FieldDescriptorProto
+// - slice of nested descriptor messages
+// - slice of nested enums
+func buildFieldDescriptor(
+	parentMsg *descriptorpb.DescriptorProto,
+	field arrow.Field,
+	index int32,
+	cfg *ConvertConfig,
+) (*descriptorpb.FieldDescriptorProto, []*descriptorpb.DescriptorProto, []*descriptorpb.EnumDescriptorProto, error) {
+
+	fd := &descriptorpb.FieldDescriptorProto{
+		Name:   proto.String(field.Name),
+		Number: proto.Int32(index),
 	}
-	files, err := protodesc.NewFiles(fdset)
+	nestedMsgs := []*descriptorpb.DescriptorProto{}
+	nestedEnums := []*descriptorpb.EnumDescriptorProto{}
+
+	// 1) Struct => nested message
+	if st, ok := field.Type.(*arrow.StructType); ok {
+		nestedName := fmt.Sprintf("%s_struct_%d", field.Name, index)
+		desc, enums, err := arrowStructToDescriptor(nestedName, st, cfg)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+		fd.TypeName = proto.String(nestedName)
+		nestedMsgs = append(nestedMsgs, desc)
+		nestedEnums = append(nestedEnums, enums...)
+		return fd, nestedMsgs, nestedEnums, nil
+	}
+
+	// 2) List => repeated
+	switch lt := field.Type.(type) {
+	case *arrow.ListType:
+		fd.Label = descriptorpb.FieldDescriptorProto_Label(descriptorpb.FieldDescriptorProto_LABEL_REPEATED).Enum()
+		elemField := arrow.Field{Name: field.Name + "_elem", Type: lt.Elem()}
+		elemFD, moNested, moEnum, err := buildFieldDescriptor(parentMsg, elemField, index, cfg)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		fd.Type = elemFD.Type
+		fd.TypeName = elemFD.TypeName
+		nestedMsgs = append(nestedMsgs, moNested...)
+		nestedEnums = append(nestedEnums, moEnum...)
+		return fd, nestedMsgs, nestedEnums, nil
+
+	case *arrow.LargeListType:
+		fd.Label = descriptorpb.FieldDescriptorProto_Label(descriptorpb.FieldDescriptorProto_LABEL_REPEATED).Enum()
+		elemField := arrow.Field{Name: field.Name + "_elem", Type: lt.Elem()}
+		elemFD, moNested, moEnum, err := buildFieldDescriptor(parentMsg, elemField, index, cfg)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		fd.Type = elemFD.Type
+		fd.TypeName = elemFD.TypeName
+		nestedMsgs = append(nestedMsgs, moNested...)
+		nestedEnums = append(nestedEnums, moEnum...)
+		return fd, nestedMsgs, nestedEnums, nil
+
+	case *arrow.FixedSizeListType:
+		fd.Label = descriptorpb.FieldDescriptorProto_Label(descriptorpb.FieldDescriptorProto_LABEL_REPEATED).Enum()
+		elemField := arrow.Field{Name: field.Name + "_elem", Type: lt.Elem()}
+		elemFD, moNested, moEnum, err := buildFieldDescriptor(parentMsg, elemField, index, cfg)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		fd.Type = elemFD.Type
+		fd.TypeName = elemFD.TypeName
+		nestedMsgs = append(nestedMsgs, moNested...)
+		nestedEnums = append(nestedEnums, moEnum...)
+		return fd, nestedMsgs, nestedEnums, nil
+	}
+
+	// 3) Dictionary => maybe enum
+	if dt, ok := field.Type.(*arrow.DictionaryType); ok {
+		if cfg.MapDictionariesToEnums {
+			// Build an enum inside the top-level message
+			enumName := fmt.Sprintf("%s_dictEnum_%d", field.Name, index)
+			// The field references: "ParentMsgName.enumName"
+			parentName := parentMsg.GetName()
+			fullEnumRef := fmt.Sprintf("%s.%s", parentName, enumName)
+
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_ENUM).Enum()
+			fd.TypeName = &fullEnumRef
+
+			// Build an EnumDescriptorProto
+			enumDesc := &descriptorpb.EnumDescriptorProto{
+				Name: proto.String(enumName),
+				Value: []*descriptorpb.EnumValueDescriptorProto{
+					{
+						Name:   proto.String("UNDEFINED"),
+						Number: proto.Int32(0),
+					},
+				},
+			}
+			// We'll attach it as a nested enum to `parentMsg` later. But we can just return it here.
+			nestedEnums = append(nestedEnums, enumDesc)
+			return fd, nil, nestedEnums, nil
+		}
+		// otherwise fallback to dictionary's ValueType
+		eqField := arrow.Field{Name: field.Name, Type: dt.ValueType}
+		return buildFieldDescriptor(parentMsg, eqField, index, cfg)
+	}
+
+	// 4) Basic arrow => proto
+	tmap := defaultTypeMappings(cfg)
+	protoType, ok := tmap[field.Type.ID()]
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("unsupported Arrow type: %v", field.Type)
+	}
+	fd.Type = protoType.Enum()
+
+	if field.Type.ID() == arrow.TIMESTAMP && cfg.UseWellKnownTimestamps {
+		fd.TypeName = proto.String(".google.protobuf.Timestamp")
+	}
+	if cfg.UseWrapperTypes {
+		switch protoType {
+		case descriptorpb.FieldDescriptorProto_TYPE_INT64:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String(".google.protobuf.Int64Value")
+		case descriptorpb.FieldDescriptorProto_TYPE_BOOL:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String(".google.protobuf.BoolValue")
+		case descriptorpb.FieldDescriptorProto_TYPE_DOUBLE:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String(".google.protobuf.DoubleValue")
+		case descriptorpb.FieldDescriptorProto_TYPE_STRING:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String(".google.protobuf.StringValue")
+		}
+	}
+
+	return fd, nil, nil, nil
+}
+
+// arrowStructToDescriptor builds a nested DescriptorProto for struct fields
+// also collecting any enums from dictionary subfields
+func arrowStructToDescriptor(name string, st *arrow.StructType, cfg *ConvertConfig) (*descriptorpb.DescriptorProto, []*descriptorpb.EnumDescriptorProto, error) {
+	desc := &descriptorpb.DescriptorProto{Name: proto.String(name)}
+	var nestedEnums []*descriptorpb.EnumDescriptorProto
+
+	for i, f := range st.Fields() {
+		fd, moNested, moEnum, err := buildFieldDescriptor(desc, f, int32(i+1), cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		desc.Field = append(desc.Field, fd)
+		desc.NestedType = append(desc.NestedType, moNested...)
+		nestedEnums = append(nestedEnums, moEnum...)
+	}
+	return desc, nestedEnums, nil
+}
+
+// ----------------------------------------------------------------------------
+// 4) File Compilation (Include WKT Descriptors)
+// ----------------------------------------------------------------------------
+
+// Global lazy init of well-known file descriptors
+var (
+	wellKnownOnce sync.Once
+	wellKnownFDS  *descriptorpb.FileDescriptorSet
+)
+
+// mustLoadWellKnownTypes builds a FileDescriptorSet containing the descriptors
+// for google.protobuf.Timestamp, google.protobuf.Wrappers, etc.
+func mustLoadWellKnownTypes() *descriptorpb.FileDescriptorSet {
+	wellKnownOnce.Do(func() {
+		w1 := protodesc.ToFileDescriptorProto(timestamppb.File_google_protobuf_timestamp_proto)
+		w2 := protodesc.ToFileDescriptorProto(wrapperspb.File_google_protobuf_wrappers_proto)
+		wellKnownFDS = &descriptorpb.FileDescriptorSet{File: []*descriptorpb.FileDescriptorProto{w1, w2}}
+	})
+	return wellKnownFDS
+}
+
+// CompileFileDescriptorProto merges your generated FileDescriptorProto
+// with the WKT descriptors so that references to google.protobuf.Timestamp, etc., can be resolved.
+func CompileFileDescriptorProto(fdp *descriptorpb.FileDescriptorProto) (protoreflect.FileDescriptor, error) {
+	// 1) Start with WKT descriptors
+	allFiles := &descriptorpb.FileDescriptorSet{}
+	allFiles.File = append(allFiles.File, mustLoadWellKnownTypes().File...)
+
+	// 2) Add your own descriptor
+	allFiles.File = append(allFiles.File, fdp)
+
+	// 3) Now compile
+	files, err := protodesc.NewFiles(allFiles)
 	if err != nil {
 		logger.Error("failed to build file descriptors",
 			zap.Error(err),
@@ -198,22 +387,23 @@ func CompileFileDescriptorProto(fdp *descriptorpb.FileDescriptorProto) (protoref
 	return fd, nil
 }
 
-// Add retry mechanism for operations that might fail transiently
+// CompileFileDescriptorProtoWithRetry wraps the above in an exponential backoff.
 func CompileFileDescriptorProtoWithRetry(fdp *descriptorpb.FileDescriptorProto) (protoreflect.FileDescriptor, error) {
-	var fd protoreflect.FileDescriptor
-	operation := func() error {
-		var err error
-		fd, err = CompileFileDescriptorProto(fdp)
+	var out protoreflect.FileDescriptor
+	op := func() error {
+		fd, err := CompileFileDescriptorProto(fdp)
+		out = fd
 		return err
 	}
-
 	b := backoff.NewExponentialBackOff()
 	b.MaxElapsedTime = 3 * time.Second
-	err := backoff.Retry(operation, b)
-	return fd, err
+	if err := backoff.Retry(op, b); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-// GetTopLevelMessageDescriptor retrieves the first (top-level) message descriptor from the compiled file.
+// GetTopLevelMessageDescriptor fetches the first message from a compiled FileDescriptor.
 func GetTopLevelMessageDescriptor(fd protoreflect.FileDescriptor) (protoreflect.MessageDescriptor, error) {
 	if fd.Messages().Len() == 0 {
 		return nil, errors.New("file descriptor has no top-level messages")
@@ -221,62 +411,75 @@ func GetTopLevelMessageDescriptor(fd protoreflect.FileDescriptor) (protoreflect.
 	return fd.Messages().Get(0), nil
 }
 
-// setDynamicField sets a single field in a dynamic message, given a value from an Arrow array.
-// This function is carefully written to handle types without reflection overhead.
-func setDynamicField(msg *dynamicpb.Message, fieldDesc protoreflect.FieldDescriptor, val interface{}) {
-	if val == nil {
-		// For proto3, "unset" simply means default. If you need
-		// to differentiate null vs default, you'll need proto2 or WKT wrappers.
-		return
-	}
+// ----------------------------------------------------------------------------
+// 5) Arrow => Proto Conversions
+// ----------------------------------------------------------------------------
 
-	// If the field is repeated, we expect 'val' to be a slice. In this example,
-	// we handle it up the chain, so let's assume no repeated here unless
-	// you want to expand for lists.
-	switch fieldDesc.Kind() {
-	case protoreflect.BoolKind:
-		if b, ok := val.(bool); ok {
-			msg.Set(fieldDesc, protoreflect.ValueOfBool(b))
-		}
-	case protoreflect.Int64Kind:
-		if i, ok := val.(int64); ok {
-			msg.Set(fieldDesc, protoreflect.ValueOfInt64(i))
-		}
-	case protoreflect.DoubleKind:
-		if f, ok := val.(float64); ok {
-			msg.Set(fieldDesc, protoreflect.ValueOfFloat64(f))
-		}
-	case protoreflect.StringKind:
-		if s, ok := val.(string); ok {
-			msg.Set(fieldDesc, protoreflect.ValueOfString(s))
-		}
-	case protoreflect.BytesKind:
-		if b, ok := val.([]byte); ok {
-			msg.Set(fieldDesc, protoreflect.ValueOfBytes(b))
-		}
-	case protoreflect.MessageKind:
-		// This is a nested struct or repeated structure. If we have a map of sub-fields,
-		// recursively set them. That means `val` should be another dynamic message or
-		// a map. For brevity, see handleNestedStruct below.
-		// If you have advanced needs (lists of messages, etc.), you'll need to expand it.
-	default:
-		// For protoreflect.Kind that we haven't handled (like enum, fixed32, etc.)
-	}
-}
-
-// ExtractArrowValue is a helper that extracts the value at [rowIndex] from an Arrow array.
-// Returns `nil` if the value is NULL or an unsupported type.
 func ExtractArrowValue(col arrow.Array, rowIndex int) interface{} {
 	if col.IsNull(rowIndex) {
 		return nil
 	}
-
+	// If list => gather slice
 	switch arr := col.(type) {
-	// Boolean
+	case *array.List:
+		start := arr.Offsets()[rowIndex]
+		end := arr.Offsets()[rowIndex+1]
+		length := end - start
+		child := arr.ListValues()
+		result := make([]interface{}, 0, length)
+		for i := start; i < end; i++ {
+			if child.IsNull(int(i)) {
+				result = append(result, nil)
+			} else {
+				result = append(result, ExtractArrowValue(child, int(i)))
+			}
+		}
+		return result
+	case *array.LargeList:
+		start := arr.Offsets()[rowIndex]
+		end := arr.Offsets()[rowIndex+1]
+		length := end - start
+		child := arr.ListValues()
+		result := make([]interface{}, 0, length)
+		for i := start; i < end; i++ {
+			if child.IsNull(int(i)) {
+				result = append(result, nil)
+			} else {
+				result = append(result, ExtractArrowValue(child, int(i)))
+			}
+		}
+		return result
+	case *array.FixedSizeList:
+		child := arr.ListValues()
+		size := arr.Len()
+		offset := rowIndex * size
+		result := make([]interface{}, 0, size)
+		for i := 0; i < size; i++ {
+			idx := offset + i
+			if idx < 0 || idx >= child.Len() {
+				result = append(result, nil)
+			} else if child.IsNull(idx) {
+				result = append(result, nil)
+			} else {
+				result = append(result, ExtractArrowValue(child, idx))
+			}
+		}
+		return result
+	case *array.Dictionary:
+		// Return the integer index for now
+		return arr.GetValueIndex(rowIndex)
+	case *array.Struct:
+		// handled in handleNestedStruct
+		return nil
+	}
+	return extractScalarValue(col, rowIndex)
+}
+
+// Basic scalar extraction
+func extractScalarValue(col arrow.Array, rowIndex int) interface{} {
+	switch arr := col.(type) {
 	case *array.Boolean:
 		return arr.Value(rowIndex)
-
-	// Numeric types
 	case *array.Int8:
 		return int64(arr.Value(rowIndex))
 	case *array.Int16:
@@ -298,19 +501,19 @@ func ExtractArrowValue(col arrow.Array, rowIndex int) interface{} {
 	case *array.Float64:
 		return arr.Value(rowIndex)
 
-	// String types
+	// string
 	case *array.String:
 		return arr.Value(rowIndex)
 	case *array.LargeString:
 		return arr.Value(rowIndex)
 
-	// Binary types
+	// binary
 	case *array.Binary:
 		return arr.Value(rowIndex)
 	case *array.LargeBinary:
 		return arr.Value(rowIndex)
 
-	// Date/Time types
+	// date/time
 	case *array.Date32:
 		return arr.Value(rowIndex).ToTime().Format(time.RFC3339)
 	case *array.Date64:
@@ -320,144 +523,237 @@ func ExtractArrowValue(col arrow.Array, rowIndex int) interface{} {
 	case *array.Time64:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
 	case *array.Timestamp:
-		return arr.Value(rowIndex).ToTime(arrow.Microsecond).Format(time.RFC3339)
+		// If using well-known timestamps => we interpret as time.Time
+		return arr.Value(rowIndex).ToTime(arrow.Microsecond)
 	case *array.Duration:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
 
-	// Decimal types
+	// decimal
 	case *array.Decimal128:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
 	case *array.Decimal256:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
-
-	// Struct type (handled separately in handleNestedStruct)
-	case *array.Struct:
-		return nil
-
-	// List types (would need special handling)
-	case *array.List:
-		return nil
-	case *array.LargeList:
-		return nil
-	case *array.FixedSizeList:
-		return nil
-
-	default:
-		return nil
 	}
-}
-
-// handleNestedStruct handles filling a nested struct (dynamic sub-message) from an Arrow struct array.
-func handleNestedStruct(parentMsg *dynamicpb.Message, fieldDesc protoreflect.FieldDescriptor, structArr *array.Struct, rowIndex int) error {
-	if structArr.IsNull(rowIndex) {
-		// entire struct is null
-		return nil
-	}
-
-	// Create a new dynamic sub-message
-	nestedMsg := dynamicpb.NewMessage(fieldDesc.Message())
-	for i := 0; i < structArr.NumField(); i++ {
-		subFieldDesc := fieldDesc.Message().Fields().Get(i)
-		col := structArr.Field(i)
-		val := ExtractArrowValue(col, rowIndex)
-		setDynamicField(nestedMsg, subFieldDesc, val)
-	}
-
-	// Set the sub-message
-	parentMsg.Set(fieldDesc, protoreflect.ValueOfMessage(nestedMsg))
 	return nil
 }
 
-// RowToDynamicProto builds a single Protobuf message from one row in an Arrow Record.
-func RowToDynamicProto(record arrow.Record, msgDesc protoreflect.MessageDescriptor, rowIndex int) (*dynamicpb.Message, error) {
-	if record == nil || msgDesc == nil {
-		return nil, errors.New("record and msgDesc cannot be nil")
+// handleNestedStruct => build a nested dynamic message
+func handleNestedStruct(parentMsg *dynamicpb.Message, fd protoreflect.FieldDescriptor, structArr *array.Struct, rowIndex int, cfg *ConvertConfig) error {
+	if structArr.IsNull(rowIndex) {
+		return nil
 	}
-	if rowIndex < 0 || rowIndex >= int(record.NumRows()) {
-		return nil, fmt.Errorf("rowIndex %d out of bounds [0,%d)", rowIndex, record.NumRows())
+	nestedMsg := dynamicpb.NewMessage(fd.Message())
+	for i := 0; i < structArr.NumField(); i++ {
+		subFD := fd.Message().Fields().Get(i)
+		col := structArr.Field(i)
+		val := ExtractArrowValue(col, rowIndex)
+		setDynamicField(nestedMsg, subFD, val, cfg)
 	}
-	dynMsg := dynamicpb.NewMessage(msgDesc)
-	numFields := int(record.NumCols())
+	parentMsg.Set(fd, protoreflect.ValueOfMessage(nestedMsg))
+	return nil
+}
 
-	for colIdx := 0; colIdx < numFields; colIdx++ {
-		fieldDesc := msgDesc.Fields().Get(colIdx)
-		col := record.Column(colIdx)
-		switch arr := col.(type) {
-		case *array.Struct:
-			if err := handleNestedStruct(dynMsg, fieldDesc, arr, rowIndex); err != nil {
-				return nil, err
+// setDynamicField => repeated fields, wrapper types, etc.
+func setDynamicField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, val interface{}, cfg *ConvertConfig) {
+	if val == nil {
+		return
+	}
+	if fd.IsList() {
+		slice, ok := val.([]interface{})
+		if !ok {
+			return
+		}
+		list := msg.NewField(fd).List()
+		for _, elem := range slice {
+			v := convertToProtoValue(fd, elem)
+			if v.IsValid() {
+				list.Append(v)
 			}
+		}
+		msg.Set(fd, protoreflect.ValueOfList(list))
+		return
+	}
+	protoVal := convertToProtoValue(fd, val)
+	if protoVal.IsValid() {
+		msg.Set(fd, protoVal)
+	}
+}
+
+// convertToProtoValue handles well-known timestamps, wrappers, etc.
+func convertToProtoValue(fd protoreflect.FieldDescriptor, val interface{}) protoreflect.Value {
+	// if the field is a message, check if it's a WKT
+	if fd.Kind() == protoreflect.MessageKind {
+		fullName := string(fd.Message().FullName())
+		switch fullName {
+		case "google.protobuf.Timestamp":
+			// interpret val as time.Time or parse string
+			t, ok := val.(time.Time)
+			if !ok {
+				s, sOk := val.(string)
+				if sOk {
+					parsed, err := time.Parse(time.RFC3339, s)
+					if err == nil {
+						t = parsed
+						ok = true
+					}
+				}
+			}
+			if !ok {
+				return protoreflect.Value{}
+			}
+			ts := timestamppb.New(t)
+			return protoreflect.ValueOfMessage(ts.ProtoReflect())
+
+		case "google.protobuf.Int64Value":
+			i, ok := val.(int64)
+			if !ok {
+				return protoreflect.Value{}
+			}
+			wrap := wrapperspb.Int64(i)
+			return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+
+		case "google.protobuf.BoolValue":
+			b, ok := val.(bool)
+			if !ok {
+				return protoreflect.Value{}
+			}
+			wrap := wrapperspb.Bool(b)
+			return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+
+		case "google.protobuf.StringValue":
+			s, ok := val.(string)
+			if !ok {
+				return protoreflect.Value{}
+			}
+			wrap := wrapperspb.String(s)
+			return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+
+		case "google.protobuf.DoubleValue":
+			f, ok := val.(float64)
+			if !ok {
+				return protoreflect.Value{}
+			}
+			wrap := wrapperspb.Double(f)
+			return protoreflect.ValueOfMessage(wrap.ProtoReflect())
 		default:
-			val := ExtractArrowValue(col, rowIndex)
-			setDynamicField(dynMsg, fieldDesc, val)
+			// possibly nested struct or dictionary enum
+			return protoreflect.Value{}
 		}
 	}
 
+	switch fd.Kind() {
+	case protoreflect.BoolKind:
+		if b, ok := val.(bool); ok {
+			return protoreflect.ValueOfBool(b)
+		}
+	case protoreflect.Int64Kind:
+		if i, ok := val.(int64); ok {
+			return protoreflect.ValueOfInt64(i)
+		}
+	case protoreflect.DoubleKind:
+		if f, ok := val.(float64); ok {
+			return protoreflect.ValueOfFloat64(f)
+		}
+	case protoreflect.StringKind:
+		if s, ok := val.(string); ok {
+			return protoreflect.ValueOfString(s)
+		}
+	case protoreflect.BytesKind:
+		if b, ok := val.([]byte); ok {
+			return protoreflect.ValueOfBytes(b)
+		}
+	case protoreflect.EnumKind:
+		// dictionary => enum => val is int index
+		switch x := val.(type) {
+		case int:
+			return protoreflect.ValueOfEnum(protoreflect.EnumNumber(x))
+		case int64:
+			return protoreflect.ValueOfEnum(protoreflect.EnumNumber(x))
+		}
+	}
+	return protoreflect.Value{}
+}
+
+// ----------------------------------------------------------------------------
+// 6) Converting Arrow Records
+// ----------------------------------------------------------------------------
+
+func RowToDynamicProto(record arrow.Record, msgDesc protoreflect.MessageDescriptor, rowIndex int, cfg *ConvertConfig) (*dynamicpb.Message, error) {
+	if record == nil || msgDesc == nil {
+		return nil, errors.New("record/msgDesc cannot be nil")
+	}
+	if rowIndex < 0 || rowIndex >= int(record.NumRows()) {
+		return nil, fmt.Errorf("rowIndex %d out of bounds", rowIndex)
+	}
+	dynMsg := dynamicpb.NewMessage(msgDesc)
+	for colIdx := 0; colIdx < int(record.NumCols()); colIdx++ {
+		fd := msgDesc.Fields().Get(colIdx)
+		col := record.Column(colIdx)
+		if structArr, ok := col.(*array.Struct); ok {
+			if err := handleNestedStruct(dynMsg, fd, structArr, rowIndex, cfg); err != nil {
+				return nil, err
+			}
+		} else {
+			val := ExtractArrowValue(col, rowIndex)
+			setDynamicField(dynMsg, fd, val, cfg)
+		}
+	}
 	return dynMsg, nil
 }
 
-// RecordToDynamicProtos converts a single Arrow Record (batch) to one Protobuf message per row.
-func RecordToDynamicProtos(record arrow.Record, msgDesc protoreflect.MessageDescriptor) ([][]byte, error) {
+func RecordToDynamicProtos(rec arrow.Record, msgDesc protoreflect.MessageDescriptor, cfg *ConvertConfig) ([][]byte, error) {
 	start := time.Now()
-	defer func() {
-		logger.Info("converted record to protos",
-			zap.Int64("duration_ms", time.Since(start).Milliseconds()),
-			zap.Int("row_count", int(record.NumRows())))
-	}()
-	rowCount := int(record.NumRows())
+	rowCount := int(rec.NumRows())
 	out := make([][]byte, 0, rowCount)
 
 	for row := 0; row < rowCount; row++ {
-		dynMsg, err := RowToDynamicProto(record, msgDesc, row)
+		dyn, err := RowToDynamicProto(rec, msgDesc, row, cfg)
 		if err != nil {
 			return nil, err
 		}
-		bytes, err := proto.Marshal(dynMsg)
+		data, err := proto.Marshal(dyn)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, bytes)
+		out = append(out, data)
 	}
+	logger.Info("converted record to protos",
+		zap.Int("row_count", rowCount),
+		zap.Int64("duration_ms", time.Since(start).Milliseconds()))
 	return out, nil
 }
 
-// ArrowReaderToProtos reads from an array.RecordReader and produces a slice of Protobuf messages
-// in row-based format. For extremely large data, you may want to stream rather than build a giant slice.
-func ArrowReaderToProtos(ctx context.Context, reader array.RecordReader, msgDesc protoreflect.MessageDescriptor) ([][]byte, error) {
+func ArrowReaderToProtos(ctx context.Context, reader array.RecordReader, msgDesc protoreflect.MessageDescriptor, cfg *ConvertConfig) ([][]byte, error) {
 	defer reader.Release()
 
-	var results [][]byte
+	var all [][]byte
 	for reader.Next() {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
-			rec := reader.Record()
-			rowMsgs, err := RecordToDynamicProtos(rec, msgDesc)
-			if err != nil {
-				return nil, err
-			}
-			results = append(results, rowMsgs...)
 		}
+		rec := reader.Record()
+		rows, err := RecordToDynamicProtos(rec, msgDesc, cfg)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, rows...)
 	}
-	return results, reader.Err()
+	return all, reader.Err()
 }
 
-// ConvertInParallel is an optional helper that divides the rows of a single Arrow Record
-// among multiple goroutines, each producing row-based Protobuf messages. This can
-// significantly improve throughput on large arrays if the overhead of marshalling is high.
-func ConvertInParallel(ctx context.Context, record arrow.Record, msgDesc protoreflect.MessageDescriptor, concurrency int) ([][]byte, error) {
+// ConvertInParallel processes a single Arrow Record in parallel, chunking row ranges.
+func ConvertInParallel(ctx context.Context, record arrow.Record, msgDesc protoreflect.MessageDescriptor, concurrency int, cfg *ConvertConfig) ([][]byte, error) {
 	rowCount := int(record.NumRows())
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	// Divide the rows among workers
 	chunkSize := (rowCount + concurrency - 1) / concurrency
 
-	// We'll collect results in a big slice
 	results := make([][]byte, rowCount)
 	var wg sync.WaitGroup
-	var mu sync.Mutex // to guard write into 'results'
+	var mu sync.Mutex
 	var firstErr error
 
 	for w := 0; w < concurrency; w++ {
@@ -470,17 +766,16 @@ func ConvertInParallel(ctx context.Context, record arrow.Record, msgDesc protore
 			break
 		}
 		wg.Add(1)
-		go func(start, end int) {
+		go func(st, en int) {
 			defer wg.Done()
-			localBuf := make([][]byte, 0, end-start)
-			for row := start; row < end; row++ {
+			localBuf := make([][]byte, 0, en-st)
+			for row := st; row < en; row++ {
 				select {
 				case <-ctx.Done():
-					// Cancel
 					return
 				default:
 				}
-				dynMsg, err := RowToDynamicProto(record, msgDesc, row)
+				dyn, err := RowToDynamicProto(record, msgDesc, row, cfg)
 				if err != nil {
 					mu.Lock()
 					if firstErr == nil {
@@ -489,7 +784,7 @@ func ConvertInParallel(ctx context.Context, record arrow.Record, msgDesc protore
 					mu.Unlock()
 					return
 				}
-				b, err := proto.Marshal(dynMsg)
+				data, err := proto.Marshal(dyn)
 				if err != nil {
 					mu.Lock()
 					if firstErr == nil {
@@ -498,12 +793,11 @@ func ConvertInParallel(ctx context.Context, record arrow.Record, msgDesc protore
 					mu.Unlock()
 					return
 				}
-				localBuf = append(localBuf, b)
+				localBuf = append(localBuf, data)
 			}
-			// Store localBuf into results
 			mu.Lock()
 			for i, b := range localBuf {
-				results[start+i] = b
+				results[st+i] = b
 			}
 			mu.Unlock()
 		}(start, end)
@@ -516,7 +810,10 @@ func ConvertInParallel(ctx context.Context, record arrow.Record, msgDesc protore
 	return results, nil
 }
 
-// CreateArrowRecord creates a sample Arrow RecordBatch with some data.
+// ----------------------------------------------------------------------------
+// 7) Example Utility Functions
+// ----------------------------------------------------------------------------
+
 func CreateArrowRecord() (array.RecordReader, error) {
 	mem := memory.NewGoAllocator()
 
@@ -529,50 +826,43 @@ func CreateArrowRecord() (array.RecordReader, error) {
 	builder := array.NewRecordBuilder(mem, schema)
 	defer builder.Release()
 
-	// Append some data
 	builder.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2, 3, 4}, nil)
 	builder.Field(1).(*array.StringBuilder).AppendValues([]string{"Alice", "Bob", "Charlie", "Diana"}, nil)
 	builder.Field(2).(*array.Float64Builder).AppendValues([]float64{95.5, 89.2, 76.8, 88.0}, nil)
 
-	record := builder.NewRecord()
-	defer record.Release()
+	rec := builder.NewRecord()
+	defer rec.Release()
 
-	reader, err := array.NewRecordReader(schema, []arrow.Record{record})
+	rdr, err := array.NewRecordReader(schema, []arrow.Record{rec})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create record reader: %w", err)
 	}
-	return reader, nil
+	return rdr, nil
 }
 
-// FormatArrowJSON formats Arrow records as pretty-printed JSON for debugging.
 func FormatArrowJSON(reader array.RecordReader, output io.Writer) error {
 	defer reader.Release()
 
-	var records []map[string]interface{}
-
+	var rows []map[string]interface{}
 	for reader.Next() {
-		record := reader.Record()
-
-		for row := 0; row < int(record.NumRows()); row++ {
+		rec := reader.Record()
+		for row := 0; row < int(rec.NumRows()); row++ {
 			rowData := make(map[string]interface{})
-			for colIdx, field := range record.Schema().Fields() {
-				col := record.Column(colIdx)
-				rowData[field.Name] = ExtractArrowValue(col, row)
+			for colIdx, f := range rec.Schema().Fields() {
+				col := rec.Column(colIdx)
+				rowData[f.Name] = ExtractArrowValue(col, row)
 			}
-			records = append(records, rowData)
+			rows = append(rows, rowData)
 		}
 	}
 	if err := reader.Err(); err != nil {
 		return fmt.Errorf("error reading records: %w", err)
 	}
 
-	jsonData, err := json.MarshalIndent(records, "", "  ")
+	out, err := json.MarshalIndent(rows, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to format JSON: %w", err)
+		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
-
-	if _, err := output.Write(jsonData); err != nil {
-		return fmt.Errorf("failed to write JSON: %w", err)
-	}
-	return nil
+	_, err = output.Write(out)
+	return err
 }
