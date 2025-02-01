@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/cenkalti/backoff/v4"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -21,9 +25,16 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// ----------------------------------------------------------------------------
-// 1) Descriptor Generation
-// ----------------------------------------------------------------------------
+// Add a package-level logger
+var logger *zap.Logger
+
+func init() {
+	var err error
+	logger, err = zap.NewProduction()
+	if err != nil {
+		panic(fmt.Sprintf("failed to initialize logger: %v", err))
+	}
+}
 
 // TypeMappings maps primitive Arrow types to their corresponding
 // Protocol Buffers FieldDescriptorProto_Type. Extend for more coverage!
@@ -44,7 +55,13 @@ var TypeMappings = map[arrow.Type]descriptorpb.FieldDescriptorProto_Type{
 // GenerateUniqueMessageName provides a unique name for the top-level message.
 // In production, you might prefer a deterministic name or a different scheme.
 func GenerateUniqueMessageName(prefix string) string {
-	return fmt.Sprintf("%s_%d_%08d", prefix, time.Now().UnixNano(), rand.Int31())
+	var builder strings.Builder
+	builder.WriteString(prefix)
+	builder.WriteString("_")
+	builder.WriteString(strconv.FormatInt(time.Now().UnixNano(), 10))
+	builder.WriteString("_")
+	builder.WriteString(fmt.Sprintf("%08d", rand.Int31()))
+	return builder.String()
 }
 
 // buildFieldDescriptor builds a FieldDescriptorProto for a single Arrow field.
@@ -164,12 +181,14 @@ func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, message
 // CompileFileDescriptorProto compiles a FileDescriptorProto into a protoreflect.FileDescriptor,
 // which we can then use to obtain the top-level message descriptor for dynamic creation.
 func CompileFileDescriptorProto(fdp *descriptorpb.FileDescriptorProto) (protoreflect.FileDescriptor, error) {
-	// Create a FileDescriptorSet containing our single FileDescriptorProto
 	fdset := &descriptorpb.FileDescriptorSet{
 		File: []*descriptorpb.FileDescriptorProto{fdp},
 	}
 	files, err := protodesc.NewFiles(fdset)
 	if err != nil {
+		logger.Error("failed to build file descriptors",
+			zap.Error(err),
+			zap.String("file_name", fdp.GetName()))
 		return nil, fmt.Errorf("failed to build file descriptors: %w", err)
 	}
 	fd, err := files.FindFileByPath(fdp.GetName())
@@ -179,6 +198,21 @@ func CompileFileDescriptorProto(fdp *descriptorpb.FileDescriptorProto) (protoref
 	return fd, nil
 }
 
+// Add retry mechanism for operations that might fail transiently
+func CompileFileDescriptorProtoWithRetry(fdp *descriptorpb.FileDescriptorProto) (protoreflect.FileDescriptor, error) {
+	var fd protoreflect.FileDescriptor
+	operation := func() error {
+		var err error
+		fd, err = CompileFileDescriptorProto(fdp)
+		return err
+	}
+
+	b := backoff.NewExponentialBackOff()
+	b.MaxElapsedTime = 3 * time.Second
+	err := backoff.Retry(operation, b)
+	return fd, err
+}
+
 // GetTopLevelMessageDescriptor retrieves the first (top-level) message descriptor from the compiled file.
 func GetTopLevelMessageDescriptor(fd protoreflect.FileDescriptor) (protoreflect.MessageDescriptor, error) {
 	if fd.Messages().Len() == 0 {
@@ -186,10 +220,6 @@ func GetTopLevelMessageDescriptor(fd protoreflect.FileDescriptor) (protoreflect.
 	}
 	return fd.Messages().Get(0), nil
 }
-
-// ----------------------------------------------------------------------------
-// 2) Converting Arrow to Protobuf via Dynamic Messages
-// ----------------------------------------------------------------------------
 
 // setDynamicField sets a single field in a dynamic message, given a value from an Arrow array.
 // This function is carefully written to handle types without reflection overhead.
@@ -340,6 +370,12 @@ func handleNestedStruct(parentMsg *dynamicpb.Message, fieldDesc protoreflect.Fie
 
 // RowToDynamicProto builds a single Protobuf message from one row in an Arrow Record.
 func RowToDynamicProto(record arrow.Record, msgDesc protoreflect.MessageDescriptor, rowIndex int) (*dynamicpb.Message, error) {
+	if record == nil || msgDesc == nil {
+		return nil, errors.New("record and msgDesc cannot be nil")
+	}
+	if rowIndex < 0 || rowIndex >= int(record.NumRows()) {
+		return nil, fmt.Errorf("rowIndex %d out of bounds [0,%d)", rowIndex, record.NumRows())
+	}
 	dynMsg := dynamicpb.NewMessage(msgDesc)
 	numFields := int(record.NumCols())
 
@@ -362,6 +398,12 @@ func RowToDynamicProto(record arrow.Record, msgDesc protoreflect.MessageDescript
 
 // RecordToDynamicProtos converts a single Arrow Record (batch) to one Protobuf message per row.
 func RecordToDynamicProtos(record arrow.Record, msgDesc protoreflect.MessageDescriptor) ([][]byte, error) {
+	start := time.Now()
+	defer func() {
+		logger.Info("converted record to protos",
+			zap.Int64("duration_ms", time.Since(start).Milliseconds()),
+			zap.Int("row_count", int(record.NumRows())))
+	}()
 	rowCount := int(record.NumRows())
 	out := make([][]byte, 0, rowCount)
 
@@ -381,19 +423,23 @@ func RecordToDynamicProtos(record arrow.Record, msgDesc protoreflect.MessageDesc
 
 // ArrowReaderToProtos reads from an array.RecordReader and produces a slice of Protobuf messages
 // in row-based format. For extremely large data, you may want to stream rather than build a giant slice.
-func ArrowReaderToProtos(reader array.RecordReader, msgDesc protoreflect.MessageDescriptor) ([][]byte, error) {
+func ArrowReaderToProtos(ctx context.Context, reader array.RecordReader, msgDesc protoreflect.MessageDescriptor) ([][]byte, error) {
 	defer reader.Release()
 
 	var results [][]byte
 	for reader.Next() {
-		rec := reader.Record()
-		rowMsgs, err := RecordToDynamicProtos(rec, msgDesc)
-		if err != nil {
-			return nil, err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			rec := reader.Record()
+			rowMsgs, err := RecordToDynamicProtos(rec, msgDesc)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, rowMsgs...)
 		}
-		results = append(results, rowMsgs...)
 	}
-
 	return results, reader.Err()
 }
 
@@ -489,9 +535,11 @@ func CreateArrowRecord() (array.RecordReader, error) {
 	builder.Field(2).(*array.Float64Builder).AppendValues([]float64{95.5, 89.2, 76.8, 88.0}, nil)
 
 	record := builder.NewRecord()
+	defer record.Release()
+
 	reader, err := array.NewRecordReader(schema, []arrow.Record{record})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create record reader: %w", err)
 	}
 	return reader, nil
 }
