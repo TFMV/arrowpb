@@ -342,6 +342,7 @@ func buildFieldDescriptor(
 	}
 
 	// 4) Basic arrow => proto
+	// 4) Basic arrow => proto
 	tmap := defaultTypeMappings(cfg)
 	protoType, ok := tmap[field.Type.ID()]
 	if !ok {
@@ -352,11 +353,21 @@ func buildFieldDescriptor(
 	if field.Type.ID() == arrow.TIMESTAMP && cfg.UseWellKnownTimestamps {
 		fd.TypeName = proto.String(".google.protobuf.Timestamp")
 	}
+	// Apply wrapper types if enabled.
 	if cfg.UseWrapperTypes {
 		switch protoType {
+		case descriptorpb.FieldDescriptorProto_TYPE_INT32:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String(".google.protobuf.Int32Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_INT64:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
 			fd.TypeName = proto.String(".google.protobuf.Int64Value")
+		case descriptorpb.FieldDescriptorProto_TYPE_UINT32:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String(".google.protobuf.UInt32Value")
+		case descriptorpb.FieldDescriptorProto_TYPE_UINT64:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String(".google.protobuf.UInt64Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_BOOL:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
 			fd.TypeName = proto.String(".google.protobuf.BoolValue")
