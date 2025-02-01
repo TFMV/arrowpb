@@ -11,12 +11,17 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+// TestFormatArrowJSON verifies that Arrow records are pretty-printed as JSON.
 func TestFormatArrowJSON(t *testing.T) {
 	t.Parallel()
+
 	// Create test data
 	mem := memory.NewGoAllocator()
 	schema := arrow.NewSchema([]arrow.Field{
@@ -55,33 +60,53 @@ func TestFormatArrowJSON(t *testing.T) {
 	assert.Equal(t, expected, result)
 }
 
-func TestArrowSchemaToProto(t *testing.T) {
+// TestArrowSchemaToFileDescriptorProto tests generating a descriptor from a simple Arrow schema.
+func TestArrowSchemaToFileDescriptorProto(t *testing.T) {
 	t.Parallel()
+
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
 		{Name: "name", Type: arrow.BinaryTypes.String},
 		{Name: "active", Type: arrow.FixedWidthTypes.Boolean},
 	}, nil)
 
-	descriptor := ArrowSchemaToProto(schema)
+	fdp, err := ArrowSchemaToFileDescriptorProto(schema, "example.arrowpb", "ArrowMessage")
+	require.NoError(t, err, "failed to build file descriptor proto")
 
-	// Verify descriptor fields
-	assert.True(t, strings.HasPrefix(*descriptor.Name, "ArrowMessage_"))
-	assert.Len(t, descriptor.Field, 3)
+	// Check top-level message name
+	assert.True(t, strings.HasPrefix(fdp.GetMessageType()[0].GetName(), "ArrowMessage_"))
+	assert.Len(t, fdp.GetMessageType()[0].GetField(), 3)
 
-	// Verify field types
-	fieldTypes := make(map[string]string)
-	for _, field := range descriptor.Field {
-		fieldTypes[*field.Name] = field.Type.String()
+	// Compile descriptor
+	fd, err := CompileFileDescriptorProto(fdp)
+	require.NoError(t, err, "failed to compile file descriptor proto")
+
+	msgDesc, err := GetTopLevelMessageDescriptor(fd)
+	require.NoError(t, err, "failed to get top-level message descriptor")
+
+	// Verify the fields match the schema
+	require.Equal(t, 3, msgDesc.Fields().Len())
+
+	// Check field types via the final compiled descriptor
+	checkField := func(idx int, name string, kind protoreflect.Kind) {
+		f := msgDesc.Fields().Get(idx)
+		assert.Equal(t, name, string(f.Name()))
+		assert.Equal(t, kind, f.Kind())
 	}
 
-	assert.Equal(t, "TYPE_INT64", fieldTypes["id"])
-	assert.Equal(t, "TYPE_STRING", fieldTypes["name"])
-	assert.Equal(t, "TYPE_BOOL", fieldTypes["active"])
+	checkField(0, "id", protoreflect.Int64Kind)
+	checkField(1, "name", protoreflect.StringKind)
+	checkField(2, "active", protoreflect.BoolKind)
+
+	// (Optional) print the descriptor for debugging
+	descriptorText, _ := prototext.Marshal(fdp)
+	t.Logf("Compiled Descriptor:\n%s", descriptorText)
 }
 
+// TestCreateArrowRecord ensures our sample record creator works as expected.
 func TestCreateArrowRecord(t *testing.T) {
 	t.Parallel()
+
 	reader, err := CreateArrowRecord()
 	require.NoError(t, err)
 	defer reader.Release()
@@ -96,7 +121,7 @@ func TestCreateArrowRecord(t *testing.T) {
 	// Verify data
 	assert.True(t, reader.Next())
 	record := reader.Record()
-	assert.Equal(t, int64(3), record.NumRows())
+	require.EqualValues(t, 4, record.NumRows())
 
 	// Check column values
 	idCol := record.Column(0).(*array.Int64)
@@ -108,8 +133,10 @@ func TestCreateArrowRecord(t *testing.T) {
 	assert.Equal(t, 95.5, scoreCol.Value(0))
 }
 
-func TestArrowBatchToProto(t *testing.T) {
+// TestArrowReaderToProtos ensures that Arrow data is converted into dynamic Protobuf messages properly.
+func TestArrowReaderToProtos(t *testing.T) {
 	t.Parallel()
+
 	// Create test data
 	mem := memory.NewGoAllocator()
 	schema := arrow.NewSchema([]arrow.Field{
@@ -121,7 +148,6 @@ func TestArrowBatchToProto(t *testing.T) {
 	builder := array.NewRecordBuilder(mem, schema)
 	defer builder.Release()
 
-	// Add test data
 	builder.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2}, nil)
 	builder.Field(1).(*array.StringBuilder).AppendValues([]string{"Alice", "Bob"}, nil)
 	builder.Field(2).(*array.BooleanBuilder).AppendValues([]bool{true, false}, nil)
@@ -131,46 +157,53 @@ func TestArrowBatchToProto(t *testing.T) {
 	require.NoError(t, err)
 	defer reader.Release()
 
-	// Convert Arrow batch to Protobuf messages
-	protoDescriptor := ArrowSchemaToProto(schema)
-	protoMessages := ArrowBatchToProto(reader, protoDescriptor)
+	// 1. Build a FileDescriptorProto
+	fdp, err := ArrowSchemaToFileDescriptorProto(schema, "example.arrowpb", "ArrowMessage")
+	require.NoError(t, err)
 
-	// Verify number of messages
-	assert.Equal(t, 2, len(protoMessages))
+	// 2. Compile it
+	fd, err := CompileFileDescriptorProto(fdp)
+	require.NoError(t, err)
 
-	// Decode each Protobuf message and verify its contents
-	for i, protoMsg := range protoMessages {
-		decodedProto := &descriptorpb.DescriptorProto{}
-		err := proto.Unmarshal(protoMsg, decodedProto)
-		require.NoError(t, err, "Failed to unmarshal Protobuf message")
+	// 3. Get top-level message descriptor
+	msgDesc, err := GetTopLevelMessageDescriptor(fd)
+	require.NoError(t, err)
 
-		// Extract values from decoded message
-		fields := decodedProto.GetField()
-		assert.Len(t, fields, 3) // We expect 3 fields: id, name, active
+	// 4. Convert Arrow data -> Proto messages (wire format)
+	protoMessages, err := ArrowReaderToProtos(reader, msgDesc)
+	require.NoError(t, err)
 
-		expectedValues := map[string]string{
-			"id":     "1",
-			"name":   "Alice",
-			"active": "true",
-		}
-		if i == 1 {
-			expectedValues = map[string]string{
-				"id":     "2",
-				"name":   "Bob",
-				"active": "false",
-			}
-		}
+	// We should have 2 messages total
+	require.Len(t, protoMessages, 2)
 
-		for _, field := range fields {
-			fieldName := field.GetName()
-			assert.Contains(t, expectedValues, fieldName)
+	// 5. Unmarshal each message and verify
+	for i, msgBytes := range protoMessages {
+		dynMsg := dynamicpb.NewMessage(msgDesc)
+		err := proto.Unmarshal(msgBytes, dynMsg)
+		require.NoError(t, err, "Failed to unmarshal dynamic message")
+
+		// Check fields
+		idVal := dynMsg.Get(msgDesc.Fields().ByName("id"))
+		nameVal := dynMsg.Get(msgDesc.Fields().ByName("name"))
+		activeVal := dynMsg.Get(msgDesc.Fields().ByName("active"))
+
+		if i == 0 {
+			assert.EqualValues(t, 1, idVal.Int())
+			assert.Equal(t, "Alice", nameVal.String())
+			assert.Equal(t, true, activeVal.Bool())
+		} else {
+			assert.EqualValues(t, 2, idVal.Int())
+			assert.Equal(t, "Bob", nameVal.String())
+			assert.Equal(t, false, activeVal.Bool())
 		}
 	}
 }
 
+// TestArrowNestedFields checks that we can handle a struct field with nested columns.
 func TestArrowNestedFields(t *testing.T) {
 	t.Parallel()
-	// Create test data with nested fields
+
+	// Create a schema with a nested (Struct) field
 	mem := memory.NewGoAllocator()
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
@@ -183,7 +216,7 @@ func TestArrowNestedFields(t *testing.T) {
 	builder := array.NewRecordBuilder(mem, schema)
 	defer builder.Release()
 
-	// Add test data
+	// Populate row #1
 	builder.Field(0).(*array.Int64Builder).AppendValues([]int64{1}, nil)
 	userBuilder := builder.Field(1).(*array.StructBuilder)
 	userBuilder.Append(true)
@@ -193,10 +226,39 @@ func TestArrowNestedFields(t *testing.T) {
 	record := builder.NewRecord()
 	reader, err := array.NewRecordReader(schema, []arrow.Record{record})
 	require.NoError(t, err)
+	defer reader.Release()
 
-	// Verify nested field values
-	assert.True(t, reader.Next())
-	nestedRecord := reader.Record().Column(1).(*array.Struct)
-	assert.Equal(t, "Alice", nestedRecord.Field(0).(*array.String).Value(0))
-	assert.Equal(t, int64(30), nestedRecord.Field(1).(*array.Int64).Value(0))
+	// 1. Convert the Arrow schema -> descriptor
+	fdp, err := ArrowSchemaToFileDescriptorProto(schema, "example.nested", "NestedTest")
+	require.NoError(t, err, "failed to build FileDescriptorProto")
+
+	fd, err := CompileFileDescriptorProto(fdp)
+	require.NoError(t, err, "failed to compile file descriptor")
+
+	msgDesc, err := GetTopLevelMessageDescriptor(fd)
+	require.NoError(t, err, "failed to get message descriptor")
+
+	// 2. Convert entire record to Protos
+	protoMsgs, err := ArrowReaderToProtos(reader, msgDesc)
+	require.NoError(t, err)
+	require.Len(t, protoMsgs, 1, "should have exactly one row")
+
+	// 3. Decode dynamic message
+	dynMsg := dynamicpb.NewMessage(msgDesc)
+	require.NoError(t, proto.Unmarshal(protoMsgs[0], dynMsg))
+
+	// Check top-level "id"
+	idVal := dynMsg.Get(msgDesc.Fields().ByName("id"))
+	assert.EqualValues(t, 1, idVal.Int())
+
+	// user is a MessageKind field
+	userField := msgDesc.Fields().ByName("user")
+	userMsg := dynMsg.Get(userField).Message()
+
+	// Check user.name, user.age
+	nameVal := userMsg.Get(userField.Message().Fields().ByName("name"))
+	ageVal := userMsg.Get(userField.Message().Fields().ByName("age"))
+
+	assert.Equal(t, "Alice", nameVal.String())
+	assert.EqualValues(t, 30, ageVal.Int())
 }
