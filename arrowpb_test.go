@@ -21,10 +21,6 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// ----------------------------------------------------------------------------
-// Reuse existing tests (your original suite)...
-// ----------------------------------------------------------------------------
-
 // TestFormatArrowJSON verifies that Arrow records are pretty-printed as JSON.
 func TestFormatArrowJSON(t *testing.T) {
 	t.Parallel()
