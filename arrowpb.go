@@ -93,15 +93,45 @@ type ConvertConfig struct {
 // defaultTypeMappings returns base arrow->proto mapping, factoring in well-known timestamps.
 func defaultTypeMappings(cfg *ConvertConfig) map[arrow.Type]descriptorpb.FieldDescriptorProto_Type {
 	out := map[arrow.Type]descriptorpb.FieldDescriptorProto_Type{
-		arrow.BOOL:      descriptorpb.FieldDescriptorProto_TYPE_BOOL,
-		arrow.INT64:     descriptorpb.FieldDescriptorProto_TYPE_INT64,
-		arrow.UINT64:    descriptorpb.FieldDescriptorProto_TYPE_UINT64,
-		arrow.FLOAT64:   descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
-		arrow.STRING:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
-		arrow.BINARY:    descriptorpb.FieldDescriptorProto_TYPE_BYTES,
+		// Boolean
+		arrow.BOOL: descriptorpb.FieldDescriptorProto_TYPE_BOOL,
+
+		// Signed integers
+		arrow.INT8:  descriptorpb.FieldDescriptorProto_TYPE_INT32,
+		arrow.INT16: descriptorpb.FieldDescriptorProto_TYPE_INT32,
+		arrow.INT32: descriptorpb.FieldDescriptorProto_TYPE_INT32,
+		arrow.INT64: descriptorpb.FieldDescriptorProto_TYPE_INT64,
+
+		// Unsigned integers
+		arrow.UINT8:  descriptorpb.FieldDescriptorProto_TYPE_UINT32,
+		arrow.UINT16: descriptorpb.FieldDescriptorProto_TYPE_UINT32,
+		arrow.UINT32: descriptorpb.FieldDescriptorProto_TYPE_UINT32,
+		arrow.UINT64: descriptorpb.FieldDescriptorProto_TYPE_UINT64,
+
+		// Floating point numbers
+		arrow.FLOAT16: descriptorpb.FieldDescriptorProto_TYPE_DOUBLE, // No native half-precision; map to double
+		arrow.FLOAT32: descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
+		arrow.FLOAT64: descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
+
+		// Strings
+		arrow.STRING:       descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.LARGE_STRING: descriptorpb.FieldDescriptorProto_TYPE_STRING,
+
+		// Binary data
+		arrow.BINARY:       descriptorpb.FieldDescriptorProto_TYPE_BYTES,
+		arrow.LARGE_BINARY: descriptorpb.FieldDescriptorProto_TYPE_BYTES,
+
+		// Date/Time types as strings (or use well-known types if desired)
 		arrow.DATE32:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
 		arrow.DATE64:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
-		arrow.TIMESTAMP: descriptorpb.FieldDescriptorProto_TYPE_STRING, // override below if UseWellKnownTimestamps
+		arrow.TIME32:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.TIME64:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.TIMESTAMP: descriptorpb.FieldDescriptorProto_TYPE_STRING, // will be overridden below if UseWellKnownTimestamps
+		arrow.DURATION:  descriptorpb.FieldDescriptorProto_TYPE_STRING,
+
+		// Decimal types mapped to strings (custom handling could be added if needed)
+		arrow.DECIMAL128: descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.DECIMAL256: descriptorpb.FieldDescriptorProto_TYPE_STRING,
 	}
 	if cfg.UseWellKnownTimestamps {
 		out[arrow.TIMESTAMP] = descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
@@ -176,16 +206,34 @@ func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, message
 
 	// 5) If we reference WKT => add dependency
 	//    This helps the compiler see "google/protobuf/timestamp.proto" or "wrappers.proto"
+	// Add dependency for well-known timestamp if requested.
 	if cfg.UseWellKnownTimestamps {
-		fdp.Dependency = append(fdp.Dependency, "google/protobuf/timestamp.proto")
+		tsDep := "google/protobuf/timestamp.proto"
+		if !contains(fdp.Dependency, tsDep) {
+			fdp.Dependency = append(fdp.Dependency, tsDep)
+		}
 	}
+
+	// Add dependency for wrappers if requested.
 	if cfg.UseWrapperTypes {
-		fdp.Dependency = append(fdp.Dependency, "google/protobuf/wrappers.proto")
+		wrapDep := "google/protobuf/wrappers.proto"
+		if !contains(fdp.Dependency, wrapDep) {
+			fdp.Dependency = append(fdp.Dependency, wrapDep)
+		}
 	}
 
 	// 6) Store in cache
 	cfg.DescriptorCache.Store(schema, fdp)
 	return fdp, nil
+}
+
+func contains(deps []string, dep string) bool {
+	for _, d := range deps {
+		if d == dep {
+			return true
+		}
+	}
+	return false
 }
 
 // buildFieldDescriptor constructs a single field, returning:
@@ -479,42 +527,49 @@ func ExtractArrowValue(col arrow.Array, rowIndex int) interface{} {
 // Basic scalar extraction
 func extractScalarValue(col arrow.Array, rowIndex int) interface{} {
 	switch arr := col.(type) {
+	// Boolean
 	case *array.Boolean:
 		return arr.Value(rowIndex)
+
+	// Signed integers: convert INT8 and INT16 to int32; INT32 remains; INT64 as is.
 	case *array.Int8:
-		return int64(arr.Value(rowIndex))
+		return int32(arr.Value(rowIndex))
 	case *array.Int16:
-		return int64(arr.Value(rowIndex))
+		return int32(arr.Value(rowIndex))
 	case *array.Int32:
-		return int64(arr.Value(rowIndex))
+		return arr.Value(rowIndex)
 	case *array.Int64:
 		return arr.Value(rowIndex)
+
+	// Unsigned integers: convert UINT8 and UINT16 to uint32; UINT32 remains; UINT64 as is.
 	case *array.Uint8:
-		return int64(arr.Value(rowIndex))
+		return uint32(arr.Value(rowIndex))
 	case *array.Uint16:
-		return int64(arr.Value(rowIndex))
+		return uint32(arr.Value(rowIndex))
 	case *array.Uint32:
-		return int64(arr.Value(rowIndex))
+		return arr.Value(rowIndex)
 	case *array.Uint64:
 		return arr.Value(rowIndex)
+
+	// Floating point numbers: convert FLOAT32 to float64 and leave FLOAT64 as is.
 	case *array.Float32:
 		return float64(arr.Value(rowIndex))
 	case *array.Float64:
 		return arr.Value(rowIndex)
 
-	// string
+	// Strings: both standard and large strings.
 	case *array.String:
 		return arr.Value(rowIndex)
 	case *array.LargeString:
 		return arr.Value(rowIndex)
 
-	// binary
+	// Binary types: both standard and large.
 	case *array.Binary:
 		return arr.Value(rowIndex)
 	case *array.LargeBinary:
 		return arr.Value(rowIndex)
 
-	// date/time
+	// Date/Time types: return formatted RFC3339 strings.
 	case *array.Date32:
 		return arr.Value(rowIndex).ToTime().Format(time.RFC3339)
 	case *array.Date64:
@@ -523,13 +578,16 @@ func extractScalarValue(col arrow.Array, rowIndex int) interface{} {
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
 	case *array.Time64:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
+
+	// Timestamp: return a time.Time (to be wrapped later if needed).
 	case *array.Timestamp:
-		// If using well-known timestamps => we interpret as time.Time
 		return arr.Value(rowIndex).ToTime(arrow.Microsecond)
+
+	// Duration: return a formatted string.
 	case *array.Duration:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
 
-	// decimal
+	// Decimals: return a string representation.
 	case *array.Decimal128:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
 	case *array.Decimal256:
