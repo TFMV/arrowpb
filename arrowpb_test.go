@@ -2,6 +2,7 @@ package arrowpb
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -170,7 +171,7 @@ func TestArrowReaderToProtos(t *testing.T) {
 	require.NoError(t, err)
 
 	// 4. Convert Arrow data -> Proto messages (wire format)
-	protoMessages, err := ArrowReaderToProtos(reader, msgDesc)
+	protoMessages, err := ArrowReaderToProtos(context.Background(), reader, msgDesc)
 	require.NoError(t, err)
 
 	// We should have 2 messages total
@@ -239,7 +240,7 @@ func TestArrowNestedFields(t *testing.T) {
 	require.NoError(t, err, "failed to get message descriptor")
 
 	// 2. Convert entire record to Protos
-	protoMsgs, err := ArrowReaderToProtos(reader, msgDesc)
+	protoMsgs, err := ArrowReaderToProtos(context.Background(), reader, msgDesc)
 	require.NoError(t, err)
 	require.Len(t, protoMsgs, 1, "should have exactly one row")
 
