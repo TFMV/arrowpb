@@ -95,6 +95,7 @@ func defaultTypeMappings(cfg *ConvertConfig) map[arrow.Type]descriptorpb.FieldDe
 	out := map[arrow.Type]descriptorpb.FieldDescriptorProto_Type{
 		arrow.BOOL:      descriptorpb.FieldDescriptorProto_TYPE_BOOL,
 		arrow.INT64:     descriptorpb.FieldDescriptorProto_TYPE_INT64,
+		arrow.UINT64:    descriptorpb.FieldDescriptorProto_TYPE_UINT64,
 		arrow.FLOAT64:   descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
 		arrow.STRING:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
 		arrow.BINARY:    descriptorpb.FieldDescriptorProto_TYPE_BYTES,
@@ -495,7 +496,7 @@ func extractScalarValue(col arrow.Array, rowIndex int) interface{} {
 	case *array.Uint32:
 		return int64(arr.Value(rowIndex))
 	case *array.Uint64:
-		return int64(arr.Value(rowIndex))
+		return arr.Value(rowIndex)
 	case *array.Float32:
 		return float64(arr.Value(rowIndex))
 	case *array.Float64:
@@ -670,6 +671,13 @@ func convertToProtoValue(fd protoreflect.FieldDescriptor, val interface{}) proto
 		case int64:
 			return protoreflect.ValueOfEnum(protoreflect.EnumNumber(x))
 		}
+	case protoreflect.Uint64Kind:
+		if u, ok := val.(uint64); ok {
+			return protoreflect.ValueOfUint64(u)
+		}
+		logger.Debug("uint64 conversion failed",
+			zap.Any("value", val),
+			zap.String("type", fmt.Sprintf("%T", val)))
 	}
 	return protoreflect.Value{}
 }
