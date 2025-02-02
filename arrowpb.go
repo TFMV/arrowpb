@@ -580,29 +580,36 @@ func extractScalarValue(col arrow.Array, rowIndex int) interface{} {
 	case *array.LargeBinary:
 		return arr.Value(rowIndex)
 
-	// Date/Time types: return formatted RFC3339 strings.
+	// Date/Time types: preserve timezone
 	case *array.Date32:
-		return arr.Value(rowIndex).ToTime().Format(time.RFC3339)
+		t := arrow.Date32(arr.Value(rowIndex)).ToTime()
+		// Convert to CST
+		return t.In(time.FixedZone("CST", -6*3600)).Format(time.RFC3339)
 	case *array.Date64:
-		return arr.Value(rowIndex).ToTime().Format(time.RFC3339)
+		t := arrow.Date64(arr.Value(rowIndex)).ToTime()
+		// Convert to CST
+		return t.In(time.FixedZone("CST", -6*3600)).Format(time.RFC3339)
 	case *array.Time32:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
 	case *array.Time64:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
-
-	// Timestamp: return a time.Time (to be wrapped later if needed).
 	case *array.Timestamp:
-		return arr.Value(rowIndex).ToTime(arrow.Microsecond)
+		t := arr.Value(rowIndex).ToTime(arrow.Microsecond)
+		return t
 
 	// Duration: return a formatted string.
 	case *array.Duration:
 		return fmt.Sprintf("%v", arr.Value(rowIndex))
 
-	// Decimals: return a string representation.
+	// Decimals: return a string representation with proper scale
 	case *array.Decimal128:
-		return fmt.Sprintf("%v", arr.Value(rowIndex))
+		val := arr.Value(rowIndex)
+		typ := arr.DataType().(*arrow.Decimal128Type)
+		return val.ToString(typ.Scale)
 	case *array.Decimal256:
-		return fmt.Sprintf("%v", arr.Value(rowIndex))
+		val := arr.Value(rowIndex)
+		typ := arr.DataType().(*arrow.Decimal256Type)
+		return val.ToString(typ.Scale)
 	}
 	return nil
 }
@@ -651,36 +658,65 @@ func setDynamicField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, va
 
 // convertToProtoValue handles well-known timestamps, wrappers, etc.
 func convertToProtoValue(fd protoreflect.FieldDescriptor, val interface{}) protoreflect.Value {
-	// if the field is a message, check if it's a WKT
 	if fd.Kind() == protoreflect.MessageKind {
 		fullName := string(fd.Message().FullName())
 		switch fullName {
 		case "google.protobuf.Timestamp":
-			// interpret val as time.Time or parse string
-			t, ok := val.(time.Time)
-			if !ok {
-				s, sOk := val.(string)
-				if sOk {
-					parsed, err := time.Parse(time.RFC3339, s)
-					if err == nil {
-						t = parsed
-						ok = true
-					}
+			switch v := val.(type) {
+			case time.Time:
+				ts := timestamppb.New(v)
+				return protoreflect.ValueOfMessage(ts.ProtoReflect())
+			case string:
+				if parsed, err := time.Parse(time.RFC3339, v); err == nil {
+					ts := timestamppb.New(parsed)
+					return protoreflect.ValueOfMessage(ts.ProtoReflect())
 				}
 			}
-			if !ok {
-				return protoreflect.Value{}
-			}
-			ts := timestamppb.New(t)
-			return protoreflect.ValueOfMessage(ts.ProtoReflect())
+			return protoreflect.Value{}
 
 		case "google.protobuf.Int64Value":
-			i, ok := val.(int64)
-			if !ok {
-				return protoreflect.Value{}
+			if i, ok := val.(int64); ok {
+				wrap := wrapperspb.Int64(i)
+				return protoreflect.ValueOfMessage(wrap.ProtoReflect())
 			}
-			wrap := wrapperspb.Int64(i)
-			return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+			return protoreflect.Value{}
+
+		case "google.protobuf.UInt64Value":
+			if u, ok := val.(uint64); ok {
+				wrap := wrapperspb.UInt64(u)
+				return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+			}
+			return protoreflect.Value{}
+
+		case "google.protobuf.Int32Value":
+			if i, ok := val.(int32); ok {
+				wrap := wrapperspb.Int32(i)
+				return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+			}
+			switch v := val.(type) {
+			case int8:
+				wrap := wrapperspb.Int32(int32(v))
+				return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+			case int16:
+				wrap := wrapperspb.Int32(int32(v))
+				return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+			}
+			return protoreflect.Value{}
+
+		case "google.protobuf.UInt32Value":
+			if u, ok := val.(uint32); ok {
+				wrap := wrapperspb.UInt32(u)
+				return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+			}
+			switch v := val.(type) {
+			case uint8:
+				wrap := wrapperspb.UInt32(uint32(v))
+				return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+			case uint16:
+				wrap := wrapperspb.UInt32(uint32(v))
+				return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+			}
+			return protoreflect.Value{}
 
 		case "google.protobuf.BoolValue":
 			b, ok := val.(bool)
@@ -705,6 +741,7 @@ func convertToProtoValue(fd protoreflect.FieldDescriptor, val interface{}) proto
 			}
 			wrap := wrapperspb.Double(f)
 			return protoreflect.ValueOfMessage(wrap.ProtoReflect())
+
 		default:
 			// possibly nested struct or dictionary enum
 			return protoreflect.Value{}
@@ -942,4 +979,25 @@ func FormatArrowJSON(reader array.RecordReader, output io.Writer) error {
 	}
 	_, err = output.Write(out)
 	return err
+}
+
+func getWrappedValue(field protoreflect.FieldDescriptor, msg protoreflect.Message) interface{} {
+	val := msg.Get(field)
+	if field.Kind() == protoreflect.MessageKind && val.Message().IsValid() {
+		fullName := string(field.Message().FullName())
+		switch fullName {
+		case "google.protobuf.Timestamp":
+			return val.Message().Interface().(*timestamppb.Timestamp).AsTime()
+		case "google.protobuf.StringValue", "google.protobuf.Int32Value",
+			"google.protobuf.Int64Value", "google.protobuf.UInt32Value",
+			"google.protobuf.UInt64Value", "google.protobuf.DoubleValue",
+			"google.protobuf.BoolValue":
+			// All wrapper types have a "value" field
+			valueField := val.Message().Descriptor().Fields().ByName("value")
+			if valueField != nil {
+				return val.Message().Get(valueField).Interface()
+			}
+		}
+	}
+	return val.Interface()
 }
