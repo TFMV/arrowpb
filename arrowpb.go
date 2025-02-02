@@ -358,25 +358,38 @@ func buildFieldDescriptor(
 		switch protoType {
 		case descriptorpb.FieldDescriptorProto_TYPE_INT32:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String(".google.protobuf.Int32Value")
+			fd.TypeName = proto.String("google.protobuf.Int32Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_INT64:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String(".google.protobuf.Int64Value")
+			fd.TypeName = proto.String("google.protobuf.Int64Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_UINT32:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String(".google.protobuf.UInt32Value")
+			fd.TypeName = proto.String("google.protobuf.UInt32Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_UINT64:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String(".google.protobuf.UInt64Value")
+			fd.TypeName = proto.String("google.protobuf.UInt64Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_BOOL:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String(".google.protobuf.BoolValue")
+			fd.TypeName = proto.String("google.protobuf.BoolValue")
 		case descriptorpb.FieldDescriptorProto_TYPE_DOUBLE:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String(".google.protobuf.DoubleValue")
+			fd.TypeName = proto.String("google.protobuf.DoubleValue")
+		case descriptorpb.FieldDescriptorProto_TYPE_FLOAT:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String("google.protobuf.FloatValue")
 		case descriptorpb.FieldDescriptorProto_TYPE_STRING:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String(".google.protobuf.StringValue")
+			fd.TypeName = proto.String("google.protobuf.StringValue")
+		case descriptorpb.FieldDescriptorProto_TYPE_BYTES:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String("google.protobuf.BytesValue")
+		case descriptorpb.FieldDescriptorProto_TYPE_FIXED64:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String("google.protobuf.Fixed64Value")
+		case descriptorpb.FieldDescriptorProto_TYPE_FIXED32:
+			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
+			fd.TypeName = proto.String("google.protobuf.Fixed32Value")
+
 		}
 	}
 
