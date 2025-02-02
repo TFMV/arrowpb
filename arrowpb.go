@@ -50,6 +50,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/stoewer/go-strcase"
 	"go.uber.org/zap"
 
 	"google.golang.org/protobuf/proto"
@@ -79,7 +80,6 @@ func init() {
 // 2) ConvertConfig with Enhanced Options
 // ----------------------------------------------------------------------------
 
-// ConvertConfig allows fine-grained control over Arrow => Protobuf schema generation.
 type ConvertConfig struct {
 	UseWellKnownTimestamps bool // arrow.TIMESTAMP => google.protobuf.Timestamp
 	UseProto2Syntax        bool // changes FileDescriptorProto syntax to "proto2"
@@ -93,45 +93,30 @@ type ConvertConfig struct {
 // defaultTypeMappings returns base arrow->proto mapping, factoring in well-known timestamps.
 func defaultTypeMappings(cfg *ConvertConfig) map[arrow.Type]descriptorpb.FieldDescriptorProto_Type {
 	out := map[arrow.Type]descriptorpb.FieldDescriptorProto_Type{
-		// Boolean
-		arrow.BOOL: descriptorpb.FieldDescriptorProto_TYPE_BOOL,
-
-		// Signed integers
-		arrow.INT8:  descriptorpb.FieldDescriptorProto_TYPE_INT32,
-		arrow.INT16: descriptorpb.FieldDescriptorProto_TYPE_INT32,
-		arrow.INT32: descriptorpb.FieldDescriptorProto_TYPE_INT32,
-		arrow.INT64: descriptorpb.FieldDescriptorProto_TYPE_INT64,
-
-		// Unsigned integers
-		arrow.UINT8:  descriptorpb.FieldDescriptorProto_TYPE_UINT32,
-		arrow.UINT16: descriptorpb.FieldDescriptorProto_TYPE_UINT32,
-		arrow.UINT32: descriptorpb.FieldDescriptorProto_TYPE_UINT32,
-		arrow.UINT64: descriptorpb.FieldDescriptorProto_TYPE_UINT64,
-
-		// Floating point numbers
-		arrow.FLOAT16: descriptorpb.FieldDescriptorProto_TYPE_DOUBLE, // No native half-precision; map to double
-		arrow.FLOAT32: descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
-		arrow.FLOAT64: descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
-
-		// Strings
+		arrow.BOOL:         descriptorpb.FieldDescriptorProto_TYPE_BOOL,
+		arrow.INT8:         descriptorpb.FieldDescriptorProto_TYPE_INT32,
+		arrow.INT16:        descriptorpb.FieldDescriptorProto_TYPE_INT32,
+		arrow.INT32:        descriptorpb.FieldDescriptorProto_TYPE_INT32,
+		arrow.INT64:        descriptorpb.FieldDescriptorProto_TYPE_INT64,
+		arrow.UINT8:        descriptorpb.FieldDescriptorProto_TYPE_UINT32,
+		arrow.UINT16:       descriptorpb.FieldDescriptorProto_TYPE_UINT32,
+		arrow.UINT32:       descriptorpb.FieldDescriptorProto_TYPE_UINT32,
+		arrow.UINT64:       descriptorpb.FieldDescriptorProto_TYPE_UINT64,
+		arrow.FLOAT16:      descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
+		arrow.FLOAT32:      descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
+		arrow.FLOAT64:      descriptorpb.FieldDescriptorProto_TYPE_DOUBLE,
 		arrow.STRING:       descriptorpb.FieldDescriptorProto_TYPE_STRING,
 		arrow.LARGE_STRING: descriptorpb.FieldDescriptorProto_TYPE_STRING,
-
-		// Binary data
 		arrow.BINARY:       descriptorpb.FieldDescriptorProto_TYPE_BYTES,
 		arrow.LARGE_BINARY: descriptorpb.FieldDescriptorProto_TYPE_BYTES,
-
-		// Date/Time types as strings (or use well-known types if desired)
-		arrow.DATE32:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
-		arrow.DATE64:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
-		arrow.TIME32:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
-		arrow.TIME64:    descriptorpb.FieldDescriptorProto_TYPE_STRING,
-		arrow.TIMESTAMP: descriptorpb.FieldDescriptorProto_TYPE_STRING, // will be overridden below if UseWellKnownTimestamps
-		arrow.DURATION:  descriptorpb.FieldDescriptorProto_TYPE_STRING,
-
-		// Decimal types mapped to strings (custom handling could be added if needed)
-		arrow.DECIMAL128: descriptorpb.FieldDescriptorProto_TYPE_STRING,
-		arrow.DECIMAL256: descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.DATE32:       descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.DATE64:       descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.TIME32:       descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.TIME64:       descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.TIMESTAMP:    descriptorpb.FieldDescriptorProto_TYPE_STRING, // may be overridden
+		arrow.DURATION:     descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.DECIMAL128:   descriptorpb.FieldDescriptorProto_TYPE_STRING,
+		arrow.DECIMAL256:   descriptorpb.FieldDescriptorProto_TYPE_STRING,
 	}
 	if cfg.UseWellKnownTimestamps {
 		out[arrow.TIMESTAMP] = descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
@@ -143,6 +128,7 @@ func defaultTypeMappings(cfg *ConvertConfig) map[arrow.Type]descriptorpb.FieldDe
 // 3) Descriptor Generation (Lists, Structs, Dictionary => Enum, Wrappers, etc.)
 // ----------------------------------------------------------------------------
 
+// GenerateUniqueMessageName generates a unique message name.
 func GenerateUniqueMessageName(prefix string) string {
 	var builder strings.Builder
 	builder.WriteString(prefix)
@@ -153,12 +139,12 @@ func GenerateUniqueMessageName(prefix string) string {
 	return builder.String()
 }
 
+// ArrowSchemaToFileDescriptorProto creates a FileDescriptorProto from an Arrow schema.
 func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, messagePrefix string, cfg *ConvertConfig) (*descriptorpb.FileDescriptorProto, error) {
 	if cfg == nil {
 		cfg = &ConvertConfig{}
 	}
 
-	// 1) If cached
 	if val, ok := cfg.DescriptorCache.Load(schema); ok {
 		if fdp, ok2 := val.(*descriptorpb.FileDescriptorProto); ok2 {
 			logger.Info("Using cached descriptor for schema.")
@@ -166,31 +152,25 @@ func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, message
 		}
 	}
 
-	// 2) Build top-level message
 	topMsgName := GenerateUniqueMessageName(messagePrefix)
 	topDesc := &descriptorpb.DescriptorProto{Name: proto.String(topMsgName)}
 
 	var nestedEnums []*descriptorpb.EnumDescriptorProto
 
-	// 3) Build fields
 	for i, f := range schema.Fields() {
 		fd, moNested, moEnum, err := buildFieldDescriptor(topDesc, f, int32(i+1), cfg)
 		if err != nil {
 			return nil, err
 		}
 		topDesc.Field = append(topDesc.Field, fd)
-		// moNested => nested messages
 		topDesc.NestedType = append(topDesc.NestedType, moNested...)
-		// moEnum => any new enums from dictionary
 		nestedEnums = append(nestedEnums, moEnum...)
 	}
 
-	// Attach any newly built enums (e.g. from dictionary) to topDesc
 	if len(nestedEnums) > 0 {
 		topDesc.EnumType = append(topDesc.EnumType, nestedEnums...)
 	}
 
-	// 4) Build FileDescriptorProto
 	syntax := "proto3"
 	if cfg.UseProto2Syntax {
 		syntax = "proto2"
@@ -204,9 +184,6 @@ func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, message
 		Syntax: proto.String(syntax),
 	}
 
-	// 5) If we reference WKT => add dependency
-	//    This helps the compiler see "google/protobuf/timestamp.proto" or "wrappers.proto"
-	// Add dependency for well-known timestamp if requested.
 	if cfg.UseWellKnownTimestamps {
 		tsDep := "google/protobuf/timestamp.proto"
 		if !contains(fdp.Dependency, tsDep) {
@@ -214,7 +191,6 @@ func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, message
 		}
 	}
 
-	// Add dependency for wrappers if requested.
 	if cfg.UseWrapperTypes {
 		wrapDep := "google/protobuf/wrappers.proto"
 		if !contains(fdp.Dependency, wrapDep) {
@@ -222,7 +198,6 @@ func ArrowSchemaToFileDescriptorProto(schema *arrow.Schema, packageName, message
 		}
 	}
 
-	// 6) Store in cache
 	cfg.DescriptorCache.Store(schema, fdp)
 	return fdp, nil
 }
@@ -236,10 +211,8 @@ func contains(deps []string, dep string) bool {
 	return false
 }
 
-// buildFieldDescriptor constructs a single field, returning:
-// - FieldDescriptorProto
-// - slice of nested descriptor messages
-// - slice of nested enums
+// buildFieldDescriptor constructs a field descriptor from an Arrow field.
+// The key change here is that we use strcase.SnakeCase() to set a consistent field name.
 func buildFieldDescriptor(
 	parentMsg *descriptorpb.DescriptorProto,
 	field arrow.Field,
@@ -247,8 +220,10 @@ func buildFieldDescriptor(
 	cfg *ConvertConfig,
 ) (*descriptorpb.FieldDescriptorProto, []*descriptorpb.DescriptorProto, []*descriptorpb.EnumDescriptorProto, error) {
 
+	// Use snake_case for the field name for consistency.
+	fieldName := strcase.SnakeCase(field.Name)
 	fd := &descriptorpb.FieldDescriptorProto{
-		Name:   proto.String(field.Name),
+		Name:   proto.String(fieldName),
 		Number: proto.Int32(index),
 	}
 	nestedMsgs := []*descriptorpb.DescriptorProto{}
@@ -256,7 +231,7 @@ func buildFieldDescriptor(
 
 	// 1) Struct => nested message
 	if st, ok := field.Type.(*arrow.StructType); ok {
-		nestedName := fmt.Sprintf("%s_struct_%d", field.Name, index)
+		nestedName := fmt.Sprintf("%s_struct_%d", fieldName, index)
 		desc, enums, err := arrowStructToDescriptor(nestedName, st, cfg)
 		if err != nil {
 			return nil, nil, nil, err
@@ -313,16 +288,13 @@ func buildFieldDescriptor(
 	// 3) Dictionary => maybe enum
 	if dt, ok := field.Type.(*arrow.DictionaryType); ok {
 		if cfg.MapDictionariesToEnums {
-			// Build an enum inside the top-level message
-			enumName := fmt.Sprintf("%s_dictEnum_%d", field.Name, index)
-			// The field references: "ParentMsgName.enumName"
+			enumName := fmt.Sprintf("%s_dict_enum_%d", fieldName, index)
 			parentName := parentMsg.GetName()
 			fullEnumRef := fmt.Sprintf("%s.%s", parentName, enumName)
 
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_ENUM).Enum()
 			fd.TypeName = &fullEnumRef
 
-			// Build an EnumDescriptorProto
 			enumDesc := &descriptorpb.EnumDescriptorProto{
 				Name: proto.String(enumName),
 				Value: []*descriptorpb.EnumValueDescriptorProto{
@@ -332,16 +304,13 @@ func buildFieldDescriptor(
 					},
 				},
 			}
-			// We'll attach it as a nested enum to `parentMsg` later. But we can just return it here.
 			nestedEnums = append(nestedEnums, enumDesc)
 			return fd, nil, nestedEnums, nil
 		}
-		// otherwise fallback to dictionary's ValueType
 		eqField := arrow.Field{Name: field.Name, Type: dt.ValueType}
 		return buildFieldDescriptor(parentMsg, eqField, index, cfg)
 	}
 
-	// 4) Basic arrow => proto
 	// 4) Basic arrow => proto
 	tmap := defaultTypeMappings(cfg)
 	protoType, ok := tmap[field.Type.ID()]
@@ -353,12 +322,10 @@ func buildFieldDescriptor(
 	if field.Type.ID() == arrow.TIMESTAMP && cfg.UseWellKnownTimestamps {
 		fd.TypeName = proto.String(".google.protobuf.Timestamp")
 	}
-	// Don't wrap binary types
 	if field.Type.ID() == arrow.BINARY || field.Type.ID() == arrow.LARGE_BINARY {
 		fd.Type = descriptorpb.FieldDescriptorProto_TYPE_BYTES.Enum()
 		return fd, nil, nil, nil
 	}
-	// Apply wrapper types if enabled.
 	if cfg.UseWrapperTypes {
 		switch protoType {
 		case descriptorpb.FieldDescriptorProto_TYPE_INT32:
@@ -400,8 +367,7 @@ func buildFieldDescriptor(
 	return fd, nil, nil, nil
 }
 
-// arrowStructToDescriptor builds a nested DescriptorProto for struct fields
-// also collecting any enums from dictionary subfields
+// arrowStructToDescriptor builds a nested DescriptorProto for struct fields.
 func arrowStructToDescriptor(name string, st *arrow.StructType, cfg *ConvertConfig) (*descriptorpb.DescriptorProto, []*descriptorpb.EnumDescriptorProto, error) {
 	desc := &descriptorpb.DescriptorProto{Name: proto.String(name)}
 	var nestedEnums []*descriptorpb.EnumDescriptorProto
