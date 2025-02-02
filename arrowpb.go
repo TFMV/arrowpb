@@ -642,7 +642,7 @@ func setDynamicField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, va
 		}
 		list := msg.NewField(fd).List()
 		for _, elem := range slice {
-			v := convertToProtoValue(fd, elem)
+			v := convertToProtoValue(fd, elem, cfg)
 			if v.IsValid() {
 				list.Append(v)
 			}
@@ -650,14 +650,14 @@ func setDynamicField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, va
 		msg.Set(fd, protoreflect.ValueOfList(list))
 		return
 	}
-	protoVal := convertToProtoValue(fd, val)
+	protoVal := convertToProtoValue(fd, val, cfg)
 	if protoVal.IsValid() {
 		msg.Set(fd, protoVal)
 	}
 }
 
 // convertToProtoValue handles well-known timestamps, wrappers, etc.
-func convertToProtoValue(fd protoreflect.FieldDescriptor, val interface{}) protoreflect.Value {
+func convertToProtoValue(fd protoreflect.FieldDescriptor, val interface{}, cfg *ConvertConfig) protoreflect.Value {
 	if fd.Kind() == protoreflect.MessageKind {
 		fullName := string(fd.Message().FullName())
 		switch fullName {
