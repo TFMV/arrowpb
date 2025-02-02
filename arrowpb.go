@@ -353,43 +353,47 @@ func buildFieldDescriptor(
 	if field.Type.ID() == arrow.TIMESTAMP && cfg.UseWellKnownTimestamps {
 		fd.TypeName = proto.String(".google.protobuf.Timestamp")
 	}
+	// Don't wrap binary types
+	if field.Type.ID() == arrow.BINARY || field.Type.ID() == arrow.LARGE_BINARY {
+		fd.Type = descriptorpb.FieldDescriptorProto_TYPE_BYTES.Enum()
+		return fd, nil, nil, nil
+	}
 	// Apply wrapper types if enabled.
 	if cfg.UseWrapperTypes {
 		switch protoType {
 		case descriptorpb.FieldDescriptorProto_TYPE_INT32:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.Int32Value")
+			fd.TypeName = proto.String(".google.protobuf.Int32Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_INT64:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.Int64Value")
+			fd.TypeName = proto.String(".google.protobuf.Int64Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_UINT32:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.UInt32Value")
+			fd.TypeName = proto.String(".google.protobuf.UInt32Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_UINT64:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.UInt64Value")
+			fd.TypeName = proto.String(".google.protobuf.UInt64Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_BOOL:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.BoolValue")
+			fd.TypeName = proto.String(".google.protobuf.BoolValue")
 		case descriptorpb.FieldDescriptorProto_TYPE_DOUBLE:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.DoubleValue")
+			fd.TypeName = proto.String(".google.protobuf.DoubleValue")
 		case descriptorpb.FieldDescriptorProto_TYPE_FLOAT:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.FloatValue")
+			fd.TypeName = proto.String(".google.protobuf.FloatValue")
 		case descriptorpb.FieldDescriptorProto_TYPE_STRING:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.StringValue")
+			fd.TypeName = proto.String(".google.protobuf.StringValue")
 		case descriptorpb.FieldDescriptorProto_TYPE_BYTES:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.BytesValue")
+			fd.TypeName = proto.String(".google.protobuf.BytesValue")
 		case descriptorpb.FieldDescriptorProto_TYPE_FIXED64:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.Fixed64Value")
+			fd.TypeName = proto.String(".google.protobuf.Fixed64Value")
 		case descriptorpb.FieldDescriptorProto_TYPE_FIXED32:
 			fd.Type = descriptorpb.FieldDescriptorProto_Type(descriptorpb.FieldDescriptorProto_TYPE_MESSAGE).Enum()
-			fd.TypeName = proto.String("google.protobuf.Fixed32Value")
-
+			fd.TypeName = proto.String(".google.protobuf.Fixed32Value")
 		}
 	}
 
@@ -671,10 +675,20 @@ func setDynamicField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, va
 
 // convertToProtoValue handles well-known timestamps, wrappers, etc.
 func convertToProtoValue(fd protoreflect.FieldDescriptor, val interface{}, cfg *ConvertConfig) protoreflect.Value {
+	if cfg == nil {
+		cfg = &ConvertConfig{
+			UseWellKnownTimestamps: false,
+			UseWrapperTypes:        false,
+		}
+	}
+
 	if fd.Kind() == protoreflect.MessageKind {
 		fullName := string(fd.Message().FullName())
 		switch fullName {
 		case "google.protobuf.Timestamp":
+			if !cfg.UseWellKnownTimestamps {
+				return protoreflect.Value{}
+			}
 			switch v := val.(type) {
 			case time.Time:
 				ts := timestamppb.New(v)
@@ -1000,11 +1014,16 @@ func getWrappedValue(field protoreflect.FieldDescriptor, msg protoreflect.Messag
 		fullName := string(field.Message().FullName())
 		switch fullName {
 		case "google.protobuf.Timestamp":
-			return val.Message().Interface().(*timestamppb.Timestamp).AsTime()
+			// Handle dynamic message conversion for timestamp
+			tsMsg := val.Message()
+			seconds := tsMsg.Get(tsMsg.Descriptor().Fields().ByName("seconds")).Int()
+			nanos := tsMsg.Get(tsMsg.Descriptor().Fields().ByName("nanos")).Int()
+			t := time.Unix(seconds, nanos).In(time.FixedZone("CST", -6*3600))
+			return t
 		case "google.protobuf.StringValue", "google.protobuf.Int32Value",
 			"google.protobuf.Int64Value", "google.protobuf.UInt32Value",
 			"google.protobuf.UInt64Value", "google.protobuf.DoubleValue",
-			"google.protobuf.BoolValue":
+			"google.protobuf.BoolValue", "google.protobuf.BytesValue":
 			// All wrapper types have a "value" field
 			valueField := val.Message().Descriptor().Fields().ByName("value")
 			if valueField != nil {
