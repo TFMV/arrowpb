@@ -1,6 +1,7 @@
 package arrowpb
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,9 +12,12 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func TestAllDataTypes(t *testing.T) {
@@ -158,12 +162,35 @@ func TestAllDataTypes(t *testing.T) {
 			fullName := string(field.Message().FullName())
 			switch fullName {
 			case "google.protobuf.Timestamp":
-				// Handle dynamic message conversion for timestamp
+				if ts, ok := val.Message().Interface().(*timestamppb.Timestamp); ok {
+					return ts.AsTime().Format(time.RFC3339)
+				}
 				tsMsg := val.Message()
 				seconds := tsMsg.Get(tsMsg.Descriptor().Fields().ByName("seconds")).Int()
 				nanos := tsMsg.Get(tsMsg.Descriptor().Fields().ByName("nanos")).Int()
 				t := time.Unix(seconds, nanos).In(time.FixedZone("CST", -6*3600))
 				return t.Format(time.RFC3339)
+			case "google.protobuf.BytesValue":
+				// Try direct unwrapping first
+				if bw, ok := val.Message().Interface().(*wrapperspb.BytesValue); ok {
+					return bw.Value
+				}
+				// Get the raw value field
+				valueField := val.Message().Descriptor().Fields().ByName("value")
+				if valueField != nil {
+					rawValue := val.Message().Get(valueField)
+					// For debugging
+					logger.Debug("bytes value extraction",
+						zap.String("type", fmt.Sprintf("%T", rawValue.Interface())),
+						zap.Any("value", rawValue.Interface()))
+					// Get bytes directly from protoreflect.Value
+					return rawValue.Bytes()
+				}
+				// For debugging
+				logger.Debug("failed to extract bytes value",
+					zap.String("message_type", fmt.Sprintf("%T", val.Message())),
+					zap.Any("message", val.Message()))
+				return nil
 			case "google.protobuf.StringValue", "google.protobuf.Int32Value",
 				"google.protobuf.Int64Value", "google.protobuf.UInt32Value",
 				"google.protobuf.UInt64Value", "google.protobuf.DoubleValue",
@@ -197,8 +224,14 @@ func TestAllDataTypes(t *testing.T) {
 	assert.Equal(t, "hello", getWrappedValue(fields.ByName("string_field"), dynMsg).(string))
 	assert.Equal(t, "world", getWrappedValue(fields.ByName("large_string_field"), dynMsg).(string))
 
-	assert.Equal(t, []byte{0x01, 0x02}, getWrappedValue(fields.ByName("binary_field"), dynMsg).([]byte))
-	assert.Equal(t, []byte{0x03, 0x04, 0x05}, getWrappedValue(fields.ByName("large_binary_field"), dynMsg).([]byte))
+	// Binary data assertions
+	binaryVal := getWrappedValue(fields.ByName("binary_field"), dynMsg)
+	assert.IsType(t, []byte{}, binaryVal, "binary field should be []byte")
+	assert.Equal(t, []byte{0x01, 0x02}, binaryVal)
+
+	largeBinaryVal := getWrappedValue(fields.ByName("large_binary_field"), dynMsg)
+	assert.IsType(t, []byte{}, largeBinaryVal, "large binary field should be []byte")
+	assert.Equal(t, []byte{0x03, 0x04, 0x05}, largeBinaryVal)
 
 	// Date fields: stored as RFC3339 strings.
 	// Note: Arrow Date32/64 only stores dates (not times), so expect midnight in the timezone
