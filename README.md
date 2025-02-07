@@ -1,10 +1,16 @@
 # arrowpb
 
-Convert Apache Arrow records to Protocol Buffers
+Convert Apache Arrow records to Protocol Buffers Suitable for BigQuery.
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/TFMV/arrowpb)](https://goreportcard.com/report/github.com/TFMV/arrowpb)
 [![Build Status](https://github.com/TFMV/arrowpb/actions/workflows/test-and-build.yml/badge.svg)](https://github.com/TFMV/arrowpb/actions)
 [![Go Reference](https://pkg.go.dev/badge/github.com/TFMV/arrowpb.svg)](https://pkg.go.dev/github.com/TFMV/arrowpb@v1.1.0)
+
+## Features
+
+- Convert Arrow records to Protocol Buffers Suitable for BigQuery.
+- Serialize Protocol Buffers to bytes.
+- Fuzz test for serialization and deserialization.
 
 ## Examples
 
